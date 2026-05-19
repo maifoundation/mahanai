@@ -9,6 +9,21 @@ from pathlib import Path
 from typing import Any
 
 
+def _relative_time(iso: str) -> str:
+    """Convert an ISO datetime string to a human label like '2 days ago'."""
+    try:
+        dt = datetime.fromisoformat(iso)
+        delta = datetime.now() - dt
+        if delta.days == 0:
+            return "today"
+        elif delta.days == 1:
+            return "yesterday"
+        else:
+            return f"{delta.days} days ago"
+    except Exception:
+        return iso[:10] if len(iso) >= 10 else iso
+
+
 def _safe_filename(text: str, max_len: int = 60) -> str:
     """Convert arbitrary text to a safe filesystem filename stem."""
     text = str(text).strip()
@@ -169,7 +184,20 @@ def list_chats(project_name: str | None = None) -> list[dict[str, Any]]:
     result = []
     for f in sorted(chats_dir.glob("*.json"), reverse=True)[:200]:
         try:
-            result.append(json.loads(f.read_text(encoding="utf-8")))
+            data = json.loads(f.read_text(encoding="utf-8"))
+            preview = ""
+            for m in data.get("messages", []):
+                if m.get("role") == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        content = next(
+                            (p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"),
+                            "",
+                        )
+                    preview = str(content)[:70].replace("\n", " ")
+                    break
+            data["_preview"] = preview
+            result.append(data)
         except Exception:
             pass
     return result
@@ -327,17 +355,24 @@ def project_selector(current_name: str | None = None) -> str | None:
 
 # ── Chat selector UI ──────────────────────────────────────────────────────────
 
-def chat_selector(project_name: str | None = None) -> str | None:
+def chat_selector(project_name: str | None = None, filter_term: str = "") -> str | None:
     """Interactive numbered list for picking a chat. Returns chat name or None."""
     chats = list_chats(project_name)
+    if filter_term:
+        fl = filter_term.lower()
+        chats = [c for c in chats if fl in c.get("name", "").lower() or fl in c.get("_preview", "").lower()]
     if not chats:
         return None
 
-    print(f"\n  Chats {'(project: ' + project_name + ')' if project_name else '(universal)'}:\n")
+    label = f"(project: {project_name})" if project_name else "(universal)"
+    if filter_term:
+        label += f"  matching '{filter_term}'"
+    print(f"\n  Chats {label}:\n")
     for i, c in enumerate(chats):
-        ts = c.get("created", "")[:10]
-        msgs = len(c.get("messages", []))
-        print(f"  {i + 1}. {c['name']}  \033[2m{ts}  {msgs} msgs\033[0m")
+        ts = _relative_time(c.get("created", ""))
+        preview = c.get("_preview", "")
+        preview_str = f'  \033[2m"{preview[:60]}"\033[0m' if preview else ""
+        print(f"  {i + 1}. {c['name']}  \033[2m{ts}\033[0m{preview_str}")
     print()
 
     while True:

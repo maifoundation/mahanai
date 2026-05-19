@@ -11,6 +11,11 @@ from typing import Any
 from dotenv import load_dotenv
 
 _CONFIG_NAME = "config.json"
+_CONFIG_CACHE: dict[str, Any] = {}
+
+
+def _invalidate_cache(key: str) -> None:
+    _CONFIG_CACHE.pop(key, None)
 
 
 def config_file_path() -> Path:
@@ -237,10 +242,13 @@ def save_plugin(name: str, path: str, codename: str = "", reg_store: str = "", r
     plugins = data.setdefault("plugins", {})
     plugins[name] = {"name": name, "path": path, "codename": codename, "reg_store": reg_store, "reg_name": reg_name}
     _write_config(data)
+    _invalidate_cache("plugins")
 
 
 def load_plugins() -> dict[str, dict]:
-    return _read_config().get("plugins", {})
+    if "plugins" not in _CONFIG_CACHE:
+        _CONFIG_CACHE["plugins"] = _read_config().get("plugins", {})
+    return _CONFIG_CACHE["plugins"]
 
 
 def remove_plugin(name: str) -> None:
@@ -252,6 +260,7 @@ def remove_plugin(name: str) -> None:
     else:
         data.pop("plugins", None)
     _write_config(data)
+    _invalidate_cache("plugins")
 
 
 def load_always_allowed() -> dict:
@@ -286,11 +295,14 @@ def save_memory(content: str) -> str:
     memories = data.setdefault("memories", {})
     memories[mid] = {"id": mid, "content": content.strip()}
     _write_config(data)
+    _invalidate_cache("memories")
     return mid
 
 
 def load_memories() -> dict[str, dict]:
-    return _read_config().get("memories", {})
+    if "memories" not in _CONFIG_CACHE:
+        _CONFIG_CACHE["memories"] = _read_config().get("memories", {})
+    return _CONFIG_CACHE["memories"]
 
 
 def remove_memory(mid: str) -> bool:
@@ -303,6 +315,7 @@ def remove_memory(mid: str) -> bool:
     if not memories:
         data.pop("memories", None)
     _write_config(data)
+    _invalidate_cache("memories")
     return True
 
 
@@ -339,10 +352,13 @@ def save_alias(trigger: str, command: str) -> None:
     aliases = data.setdefault("aliases", {})
     aliases[trigger.strip()] = command.strip()
     _write_config(data)
+    _invalidate_cache("aliases")
 
 
 def load_aliases() -> dict[str, str]:
-    return _read_config().get("aliases", {})
+    if "aliases" not in _CONFIG_CACHE:
+        _CONFIG_CACHE["aliases"] = _read_config().get("aliases", {})
+    return _CONFIG_CACHE["aliases"]
 
 
 def remove_alias(trigger: str) -> bool:
@@ -355,6 +371,7 @@ def remove_alias(trigger: str) -> bool:
     if not aliases:
         data.pop("aliases", None)
     _write_config(data)
+    _invalidate_cache("aliases")
     return True
 
 
@@ -480,7 +497,7 @@ def save_cost_setting(enabled: bool) -> None:
 
 
 def load_cost_setting() -> bool:
-    return bool(_read_config().get("show_cost", False))
+    return bool(_read_config().get("show_cost", True))
 
 
 # ── Context window limit ──────────────────────────────────────────────────────

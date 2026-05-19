@@ -29,7 +29,7 @@ def test_safe_plugin():
     print("✅ Safe Plugin Test:")
     print(format_security_report(report))
     assert report.is_safe
-    assert len(report.issues) == 0
+    assert report.blocked_count() == 0
     print("PASSED\n")
 
 

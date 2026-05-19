@@ -1437,7 +1437,7 @@ def _auto_save_session(session_id: str, history: list[dict], model_label: str) -
 
 
 def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    return max(1, len(text.encode("utf-8")) // 4)
 
 
 def _highlight_response(response: str) -> None:
@@ -1597,7 +1597,18 @@ def _slash_command(line: str) -> tuple[str, str]:
     return cmd, arg
 
 
-def _print_help() -> None:
+def _print_help(term: str = "") -> None:
+    if term:
+        fl = term.lower()
+        matches = [(c, d) for c, d in _ALL_COMMANDS if fl in c.lower() or fl in d.lower()]
+        if matches:
+            print(f"{C.DIM}Commands matching '{term}':{C.RST}")
+            for _hc, _hd in matches:
+                print(f"  {C.OK}{_hc:<22}{C.RST} {C.DIM}{_hd}{C.RST}")
+            print()
+        else:
+            print(f"{C.DIM}No commands matching '{term}'. Use /help for full list.{C.RST}\n")
+        return
     cfg = config_file_path()
     print(
         f"{C.DIM}"
@@ -1998,7 +2009,7 @@ def main() -> None:
             if cmd in {"/exit", "/quit"}:
                 break
             if cmd == "/help":
-                _print_help()
+                _print_help(rest.strip())
                 continue
             if cmd == "/models":
                 active_model_idx = _model_selector(active_model_idx)
@@ -3027,16 +3038,32 @@ def main() -> None:
             elif cmd == "/export":
                 _fpath = rest.strip()
                 if not _fpath:
-                    _fpath = f"session-{_session_id}.md"
+                    _exp_ts = datetime.now().strftime("%Y-%m-%d-%H-%M")
+                    _fpath = str(Path.home() / f"mahanai-export-{_exp_ts}.md")
                 _out_path = Path(_fpath).expanduser().resolve()
-                _lines = [f"# Session {_session_id}\n"]
+                _exp_model = AVAILABLE_MODELS[active_model_idx]["label"]
+                _exp_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+                _lines = [
+                    "# MahanAI Chat Export",
+                    "",
+                    f"_Model: {_exp_model} · Exported: {_exp_date}_",
+                    "",
+                    "---",
+                    "",
+                ]
                 for _m in history:
                     if _m["role"] == "system":
                         continue
                     _role = "**You**" if _m["role"] == "user" else "**MahanAI**"
-                    _lines.append(f"{_role}:\n\n{_m['content']}\n\n---\n")
+                    _content = _m.get("content", "")
+                    if isinstance(_content, list):
+                        _content = "\n".join(
+                            p.get("text", "") for p in _content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    _lines.append(f"{_role}:\n\n{_content}\n\n---\n")
                 _out_path.write_text("\n".join(_lines), encoding="utf-8")
-                print(f"{C.OK}Session exported to:{C.RST} {_out_path}\n")
+                print(f"{C.OK}Exported to:{C.RST} {_out_path}\n")
                 continue
 
             # ── Model comparison ──────────────────────────────────────────────
@@ -3506,22 +3533,27 @@ def main() -> None:
             # ── Recall a previous chat ─────────────────────────────────────────
             elif cmd == "/recall":
                 _recall_name = rest.strip()
-                if not _recall_name:
-                    # Show selector
+                _recall_data = None
+                if _recall_name:
+                    _recall_data = load_chat_by_name(_recall_name, _active_project)
+                    if not _recall_data and _active_project:
+                        _recall_data = load_chat_by_name(_recall_name, None)
+                    if not _recall_data:
+                        # Fall back to filtered selector
+                        _recall_sel = chat_selector(_active_project, filter_term=_recall_name)
+                        if not _recall_sel:
+                            print(f"{C.DIM}No chats matching '{_recall_name}' found.{C.RST}\n")
+                            continue
+                        _recall_data = load_chat_by_name(_recall_sel, _active_project)
+                        _recall_name = _recall_sel
+                else:
                     _recall_name = chat_selector(_active_project)
                     if not _recall_name:
                         print(f"{C.DIM}Cancelled.{C.RST}\n")
                         continue
-                _recall_data = load_chat_by_name(_recall_name, _active_project)
+                    _recall_data = load_chat_by_name(_recall_name, _active_project)
                 if not _recall_data:
-                    # Try universal if in project mode
-                    if _active_project:
-                        _recall_data = load_chat_by_name(_recall_name, None)
-                if not _recall_data:
-                    print(
-                        f"{C.ERR}Chat '{_recall_name}' not found.{C.RST} "
-                        f"Use /recall without args to browse.\n"
-                    )
+                    print(f"{C.ERR}Chat not found.{C.RST}\n")
                     continue
                 _recall_msgs = _recall_data.get("messages", [])
                 _recall_context = (
@@ -3935,3 +3967,14 @@ def main() -> None:
         print("\n")
         history.append({"role": "assistant", "content": reply})
         _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
+
+    # ── Session exit summary ──────────────────────────────────────────────────
+    if _session_input_tokens > 0 or _session_output_tokens > 0:
+        _exit_sel = AVAILABLE_MODELS[active_model_idx]
+        _exit_key = _exit_sel.get("claude_model") or _exit_sel.get("name", "")
+        _exit_pr = _MODEL_PRICING.get(_exit_key)
+        _cost_str = f"  ~${_session_cost_usd:.4f} USD  ·" if _exit_pr else ""
+        print(
+            f"\n{C.DIM}Session ended.{_cost_str}  "
+            f"{_session_input_tokens:,} in / {_session_output_tokens:,} out tokens{C.RST}\n"
+        )
