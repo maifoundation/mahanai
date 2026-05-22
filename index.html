@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MahanAI — the perfect coding agent</title>
+<title>MahanAI — terminal AI agent with plugins & gateway</title>
 <link rel="icon" href="assets/mahan-mark.png">
 <link rel="stylesheet" href="colors_and_type.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -607,8 +607,8 @@
 <section class="hero">
   <div class="wrap">
     <div class="pill">
-      <span class="tag">Max 2.0</span>
-      <span>plugin ecosystem · gateway · multi-model</span>
+      <span class="tag">7.6.1</span>
+      <span>plugin ecosystem · gateway · multi-model · chat history</span>
       <span class="arr">→</span>
     </div>
 
@@ -620,7 +620,8 @@
     <p class="sub">
       Terminal-first. Multi-model. Approvals-first.<br>
       <b style="color:var(--fg-1);">MahanAI</b> gives you a chat interface, agentic tool use, a local
-      gateway server, and a plugin ecosystem—with custom themes and conversation branching.
+      gateway server, and a plugin ecosystem—with custom themes, conversation branching,
+      and searchable chat history.
     </p>
 
     <div class="hero-cta">
@@ -789,6 +790,15 @@
         <p>
           <code>/branch save</code> snapshots state, <code>/branch load</code>
           restores. Explore multiple paths without losing work.
+        </p>
+      </div>
+
+      <div class="card w2">
+        <div class="ico"><i data-lucide="search"></i></div>
+        <h3>Searchable chat history.</h3>
+        <p>
+          Find saved sessions by keyword with <code>/history search &lt;query&gt;</code>.
+          Pull up old chats fast instead of scrolling forever.
         </p>
       </div>
 
@@ -1034,6 +1044,10 @@
       <div class="cmd-row">
         <span class="cmd">/branch load &lt;name&gt;</span>
         <span class="desc">Restore a saved conversation branch.</span>
+      </div>
+      <div class="cmd-row">
+        <span class="cmd">/history search &lt;query&gt;</span>
+        <span class="desc">Search saved chat sessions by keyword.</span>
       </div>
       <div class="cmd-row">
         <span class="cmd">/store browse</span>
