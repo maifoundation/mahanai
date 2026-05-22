@@ -203,6 +203,80 @@ def list_chats(project_name: str | None = None) -> list[dict[str, Any]]:
     return result
 
 
+def _message_text(content: Any) -> str:
+    """Flatten a chat message content value into plain text."""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for piece in content:
+            if isinstance(piece, dict) and piece.get("type") == "text":
+                parts.append(str(piece.get("text", "")))
+        return "\n".join(parts)
+    return str(content)
+
+
+def search_chats(query: str, project_name: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """Search saved chats by metadata and message text.
+
+    Empty queries return the most recent chats.
+    """
+    chats_dir = get_chats_dir(project_name)
+    if not chats_dir.is_dir():
+        return []
+
+    needle = query.strip().lower()
+    rows: list[tuple[float, int, dict[str, Any]]] = []
+
+    for file_path in sorted(chats_dir.glob("*.json")):
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        messages = data.get("messages", [])
+        user_preview = ""
+        chunks: list[str] = [
+            str(data.get("id", "")),
+            str(data.get("name", "")),
+            str(data.get("model", "")),
+        ]
+        match_count = 0
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            text = _message_text(msg.get("content", ""))
+            if msg.get("role") == "user" and not user_preview:
+                user_preview = text[:120].replace("\n", " ")
+            chunks.append(text)
+
+        haystack = "\n".join(chunks).lower()
+        if needle:
+            if needle not in haystack:
+                continue
+            match_count = haystack.count(needle)
+
+        preview = user_preview
+        if not preview:
+            for msg in messages:
+                if isinstance(msg, dict):
+                    preview = _message_text(msg.get("content", ""))[:120].replace("\n", " ")
+                    if preview:
+                        break
+
+        try:
+            mtime = file_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        result = dict(data)
+        result["_preview"] = preview
+        result["_path"] = str(file_path)
+        rows.append((mtime, match_count, result))
+
+    rows.sort(key=lambda item: (item[1], item[0]), reverse=True)
+    return [row for _, _, row in rows[: max(0, limit)]]
+
+
 def load_chat_by_name(name: str, project_name: str | None = None) -> dict[str, Any] | None:
     """Load a chat by exact filename stem, then falls back to substring search."""
     chats_dir = get_chats_dir(project_name)

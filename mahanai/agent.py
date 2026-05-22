@@ -104,6 +104,7 @@ from mahanai.chat_history import (
     get_chats_dir,
     save_chat,
     list_chats,
+    search_chats,
     load_chat_by_name,
     rename_chat_file,
     project_selector,
@@ -496,7 +497,7 @@ _ALL_COMMANDS: list[tuple[str, str]] = [
     ("/alias",            "Create a command alias"),
     ("/aliases",          "List saved aliases"),
     ("/alias-remove",     "Remove an alias"),
-    ("/history",          "List saved chat sessions"),
+    ("/history",          "List/search saved chat sessions"),
     ("/resume",           "Load a previous session"),
     ("/export",           "Export current session to markdown"),
     ("/setup-chat-history", "Configure where chats are saved"),
@@ -1650,7 +1651,7 @@ def _print_help(term: str = "") -> None:
         f"  /aliases                    List saved aliases\n"
         f"  /alias-remove <trigger>     Remove an alias\n"
         f"\n"
-        f"  /history                    List saved chat sessions\n"
+        f"  /history                    List/search saved chat sessions\n"
         f"  /resume <id>                Load a previous session\n"
         f"  /export [path]              Export current session to markdown\n"
         f"\n"
@@ -1674,7 +1675,7 @@ def _print_help(term: str = "") -> None:
         f"\n"
         f"  /task <description>         Run a background task\n"
         f"  /task-status                Show background task status\n"
-        f"  /task-result <id>           Print a completed task result\n"
+
         f"\n"
         f"  /role save <name>           Save current system prompt as a named role\n"
         f"  /role load <name>           Switch to a saved role (built-in: coder, writer, analyst, sysadmin)\n"
@@ -3003,18 +3004,37 @@ def main() -> None:
 
             # ── Session history ───────────────────────────────────────────────
             elif cmd == "/history":
-                _sessions = list_sessions()
-                if not _sessions:
-                    print(f"{C.DIM}No saved sessions.{C.RST}\n")
+                _hsub = rest.strip()
+                if _hsub.lower().startswith("search "):
+                    _query = _hsub[7:].strip()
+                    _matches = search_chats(_query)
+                    if not _matches:
+                        print(f"{C.DIM}No saved sessions matched '{_query}'.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Search results for '{_query}':{C.RST}")
+                        for _s in _matches:
+                            _nmsg = len(_s.get("messages", []))
+                            _preview = _s.get("_preview", "")
+                            print(
+                                f"  {C.OK}{_s['id']}{C.RST}  "
+                                f"{C.DIM}{_s.get('model', '?')}  {_nmsg} messages{C.RST}"
+                            )
+                            if _preview:
+                                print(f"    {C.DIM}{_preview}{C.RST}")
+                        print()
                 else:
-                    print(f"{C.DIM}Saved sessions:{C.RST}")
-                    for _s in _sessions:
-                        _nmsg = len(_s.get("messages", []))
-                        print(
-                            f"  {C.OK}{_s['id']}{C.RST}  "
-                            f"{C.DIM}{_s.get('model', '?')}  {_nmsg} messages{C.RST}"
-                        )
-                    print()
+                    _sessions = list_sessions()
+                    if not _sessions:
+                        print(f"{C.DIM}No saved sessions.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Saved sessions:{C.RST}")
+                        for _s in _sessions:
+                            _nmsg = len(_s.get("messages", []))
+                            print(
+                                f"  {C.OK}{_s['id']}{C.RST}  "
+                                f"{C.DIM}{_s.get('model', '?')}  {_nmsg} messages{C.RST}"
+                            )
+                        print()
                 continue
             elif cmd == "/resume":
                 _sid = rest.strip()

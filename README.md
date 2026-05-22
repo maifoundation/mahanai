@@ -45,6 +45,7 @@ That's it. An onboarding wizard runs on first launch to help you pick a model an
 - **Agentic tools** — shell commands, file read/write/edit, web search, Python REPL, URL fetch — all with approval prompts and inline diffs
 - **Plan mode & effort levels** — `/plan on` to outline before acting; `/effort high` for deeper reasoning
 - **Conversation branching** — save and restore conversation states to explore multiple paths
+- **Searchable chat history** — search saved chats by keyword with `/history search <query>`
 - **Shell history awareness** — inject your recent bash/zsh history into context with `/shell-history inject`
 - **Cost tracking** — `/cost` shows session token usage and estimated spend
 - **Desktop notifications** — get pinged when a long generation finishes
@@ -159,6 +160,7 @@ load(python-dev-kit)
 | `/branch load <name>` | Restore a snapshot |
 | `/cost` | Show session token usage and cost |
 | `/memory add <text>` | Save a persistent memory |
+| `/history search <query>` | Search saved chat sessions |
 | `/shell-history inject` | Add recent shell history to context |
 | `/store browse` | Browse the plugin store |
 | `/cmd` | Fuzzy-search all 60+ commands |
