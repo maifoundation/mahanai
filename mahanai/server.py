@@ -182,7 +182,11 @@ def _oai_resp_to_anth(oai: dict, model: str) -> dict:
 
 def _make_handler(cfg: ServerConfig) -> type:
 
+    import secrets
+    from loguru import logger
+
     class Handler(BaseHTTPRequestHandler):
+        _rate_limits = {}
 
         def log_message(self, *_: object) -> None:
             pass  # suppress default Apache-style logging
@@ -190,13 +194,25 @@ def _make_handler(cfg: ServerConfig) -> type:
         # ── Auth ──────────────────────────────────────────────────────────────
 
         def _check_auth(self) -> bool:
+            # Rate limiting check
+            client_ip = self.client_address[0]
+            now = time.time()
+            last_request = Handler._rate_limits.get(client_ip, 0)
+            if now - last_request < 0.1:  # Limit to 10 requests per second
+                logger.warning(f"Rate limit exceeded for {client_ip}")
+                self._json(429, {"error": {"message": "Too many requests", "type": "rate_limit_error"}})
+                return False
+            Handler._rate_limits[client_ip] = now
+
             if not cfg.gateway_key:
                 return True  # open access
+            import secrets
             auth  = self.headers.get("Authorization", "")
             token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-            return token == cfg.gateway_key
+            return secrets.compare_digest(token, cfg.gateway_key)
 
         def _auth_error(self) -> None:
+            logger.warning(f"Authentication failure from {self.client_address}")
             if cfg.server_type == "openai":
                 self._json(401, {"error": {
                     "message": "Invalid API key.",
@@ -272,7 +288,11 @@ def _make_handler(cfg: ServerConfig) -> type:
 
         def _serve_web_ui(self) -> None:
             try:
-                body_bytes = _WEBUI_PATH.read_bytes()
+                # Use absolute path and verify it is exactly what we expect to prevent directory traversal
+                if _WEBUI_PATH.exists() and _WEBUI_PATH.is_file():
+                    body_bytes = _WEBUI_PATH.read_bytes()
+                else:
+                    raise OSError("UI file missing")
             except OSError:
                 body_bytes = b"<h1>MahanAI Web UI</h1><p>webui.html not found next to the package.</p>"
             self.send_response(200)
