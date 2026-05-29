@@ -221,7 +221,7 @@ def _print_update_notice(thread: threading.Thread) -> None:
 
 
 NVIDIA_BASE_URL = "http://89.167.0.111:8000/v1"
-DEFAULT_MODEL = "mahanai/mahanai"
+DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
 _OLLAMA_DEFAULT_API_KEY = "ollama"
 
 NVIDIA_DIRECT_URL = "https://integrate.api.nvidia.com/v1"
@@ -235,8 +235,11 @@ CODEX_REDIRECT_URI  = "http://localhost:1455/auth/callback"
 CODEX_SAFETY_MARGIN = 30  # seconds before expiry to trigger refresh
 
 AVAILABLE_MODELS: list[dict] = [
-    {"label": "MahanAI Super (legacy)", "name": "mahanai/mahanai",            "note": "legacy",   "group": "NVIDIA NIM",           "mode": "server"},
-    {"label": "Llama 3.3 70B",         "name": "meta/llama-3.3-70b-instruct","note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Meta Llama 3.3 70B",   "name": "meta/llama-3.3-70b-instruct","note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Qwen 3 Coder 480B",    "name": "qwen/qwen3-coder-480b-a35b-instruct","note": "direct", "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Moonshot Kimi K2.6",    "name": "moonshotai/kimi-k2.6",       "note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Gemma 4 31B",          "name": "google/gemma-4-31b-it",      "note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "GPT-OSS 120B",         "name": "openai/gpt-oss-120b",        "note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
     {"label": "Claude Opus 4",         "name": "claude-opus-4-7",            "note": "opus",     "group": "Claude",               "mode": "claude", "claude_model": "claude-opus-4-7"},
     {"label": "Claude Sonnet 4.6",     "name": "claude-sonnet-4-6",          "note": "sonnet",   "group": "Claude",               "mode": "claude", "claude_model": "claude-sonnet-4-6"},
     {"label": "Claude Haiku 4.5",      "name": "claude-haiku-4-5-20251001",  "note": "haiku",    "group": "Claude",               "mode": "claude", "claude_model": "claude-haiku-4-5-20251001"},
@@ -1905,11 +1908,6 @@ def main() -> None:
             f"{C.OK}NVIDIA direct mode active{C.RST} {C.DIM}(bypassing server, using NVIDIA API directly){C.RST}\n"
             f"{C.DIM}  Use /api-key-nvidia clear to switch back to server mode.{C.RST}\n"
         )
-    elif not api_key:
-        print(
-            f"{C.ERR}No API key yet.{C.RST} Use {C.OK}/api-key{C.RST} or set "
-            f"{C.DIM}MAHANAI_API_KEY{C.RST} / .env\n"
-        )
 
     if (workspace / "MAHANAI.md").is_file():
         print(f"{C.OK}🤖 MAHANAI.md{C.RST} {C.DIM}loaded as project context for all providers.{C.RST}\n")
@@ -3109,7 +3107,7 @@ def main() -> None:
                     if _csel["mode"] == "claude":
                         _run_claude_cli(_cmsg, model=_csel.get("claude_model"))
                     elif _csel["mode"] == "nvidia_direct" and nvidia_api_key:
-                        _stream_direct(nvidia_api_key, [{"role": "user", "content": _cmsg}], NVIDIA_DIRECT_MODEL, NVIDIA_DIRECT_URL)
+                        _stream_direct(nvidia_api_key, [{"role": "user", "content": _cmsg}], _csel["name"], NVIDIA_DIRECT_URL)
                     elif _csel["mode"] in ("server",) and api_key:
                         _stream_direct(api_key, [{"role": "user", "content": _cmsg}], model, NVIDIA_BASE_URL)
                     elif _csel["mode"] == "ollama":
@@ -3161,7 +3159,7 @@ def main() -> None:
                 _tid = uuid.uuid4().hex[:8]
                 _sel = AVAILABLE_MODELS[active_model_idx]
                 if _sel["mode"] == "nvidia_direct" and nvidia_api_key:
-                    _tkey, _turl, _tmodel = nvidia_api_key, NVIDIA_DIRECT_URL, NVIDIA_DIRECT_MODEL
+                    _tkey, _turl, _tmodel = nvidia_api_key, NVIDIA_DIRECT_URL, _sel["name"]
                 elif _sel["mode"] in ("server",) and api_key:
                     _tkey, _turl, _tmodel = api_key, NVIDIA_BASE_URL, model
                 elif _sel["mode"] == "ollama":
@@ -3959,7 +3957,7 @@ def main() -> None:
                 continue
             active_key = nvidia_api_key
             active_base_url = NVIDIA_DIRECT_URL
-            active_model = NVIDIA_DIRECT_MODEL
+            active_model = selected["name"]
         else:  # server mode
             if not api_key:
                 print(
