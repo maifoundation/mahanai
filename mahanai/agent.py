@@ -1,0 +1,4062 @@
+"""Chat agent loop with OpenAI-compatible NVIDIA NIM tools API."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime
+import getpass
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import httpx
+from openai import APIStatusError, OpenAI
+
+from mahanai import __version__, colors as C
+from mahanai.config import (
+    clear_codex_token,
+    clear_custom_endpoint,
+    clear_nvidia_api_key,
+    clear_saved_api_key,
+    config_file_path,
+    load_always_allowed,
+    load_codex_token,
+    load_custom_endpoint,
+    load_nvidia_api_key,
+    load_ollama_providers,
+    load_plugins,
+    load_theme,
+    load_custom_theme_path,
+    load_custom_theme_info,
+    save_interact_always_allow,
+    remove_ollama_provider,
+    remove_plugin,
+    save_interact_enabled,
+    save_custom_theme_info,
+    clear_custom_theme,
+    resolve_api_key,
+    save_api_key,
+    save_codex_token,
+    save_custom_endpoint,
+    save_nvidia_api_key,
+    save_ollama_provider,
+    save_plugin,
+    save_theme,
+    load_memories,
+    save_memory,
+    remove_memory,
+    load_prompts,
+    save_prompt,
+    remove_prompt,
+    load_aliases,
+    save_alias,
+    remove_alias,
+    sessions_dir,
+    save_session,
+    load_session,
+    list_sessions,
+    load_tokens_setting,
+    save_tokens_setting,
+    load_index_documents,
+    save_index_documents,
+    save_role,
+    load_roles,
+    remove_role,
+    save_macro,
+    load_macros,
+    remove_macro,
+    audit_log_path,
+    is_onboarding_complete,
+    mark_onboarding_complete,
+    save_cost_setting,
+    load_cost_setting,
+    save_context_limit,
+    load_context_limit,
+    load_interact_enabled,
+)
+from mahanai.mmd_parser import MmdPlugin, parse_mmd_file
+from mahanai.plugin_security import scan_plugin_security, format_security_report
+from mahanai.plugin_signer import PluginVerificationManager
+from mahanai.plugin_audit import get_audit_logger
+from mahanai.rc_parser import parse_rc_file
+from mahanai.system_info import describe_runtime
+from mahanai.tools import get_tools, batch_approve_and_execute, execute_tool, normalize_tool_arguments_json, set_autonomous_mode, is_autonomous_mode
+from mahanai.chat_history import (
+    is_chat_history_setup,
+    save_chat_history_config,
+    load_chat_history_config,
+    save_project,
+    load_projects,
+    remove_project,
+    save_active_project,
+    load_active_project,
+    get_chats_dir,
+    save_chat,
+    list_chats,
+    search_chats,
+    load_chat_by_name,
+    rename_chat_file,
+    project_selector,
+    chat_selector,
+)
+
+# ── Plugin registry ───────────────────────────────────────────────────────────
+_LOADED_PLUGINS: dict[str, MmdPlugin] = {}  # name → MmdPlugin
+_plugin_verifier = PluginVerificationManager()  # Handles signature verification
+
+
+def _inject_saved_plugins() -> None:
+    """Load persisted .mmd plugins from config on startup."""
+    for name, entry in list(load_plugins().items()):
+        p = entry.get("path", "")
+        try:
+            plugin = parse_mmd_file(p)
+            _LOADED_PLUGINS[plugin.name] = plugin
+        except Exception:
+            remove_plugin(name)
+
+
+# ── Desktop notifications ─────────────────────────────────────────────────────
+
+def _send_notification(title: str, body: str) -> None:
+    """Send a desktop notification. Best-effort, never raises."""
+    try:
+        if sys.platform.startswith("linux"):
+            subprocess.run(
+                ["notify-send", "--urgency=normal", title, body],
+                capture_output=True, timeout=3,
+            )
+        elif sys.platform == "darwin":
+            script = f'display notification "{body}" with title "{title}"'
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3)
+        elif sys.platform == "win32":
+            ps = (
+                f"Add-Type -AssemblyName System.Windows.Forms; "
+                f"[System.Windows.Forms.ToolTip]::new(); "
+                f"[System.Windows.Forms.MessageBox]::Show('{body}', '{title}')"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                capture_output=True, timeout=5,
+            )
+    except Exception:
+        pass
+
+
+def _ensure_interact_dependencies() -> tuple[bool, str]:
+    """Install or verify the computer-control dependencies."""
+    try:
+        import pyautogui  # noqa: F401
+        return True, "Interact is ready."
+    except Exception:
+        pass
+
+    installer = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "pyautogui",
+        "pillow",
+    ]
+    try:
+        proc = subprocess.run(installer, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout or "pip install failed").strip()
+    except Exception as e:
+        return False, str(e)
+
+    try:
+        import pyautogui  # noqa: F401
+        return True, "Interact is ready."
+    except Exception as e:
+        return False, str(e)
+
+
+# ── Shell history ─────────────────────────────────────────────────────────────
+
+def _get_shell_history(n: int = 20) -> list[str]:
+    """Return the last n shell commands from bash/zsh history."""
+    candidates = [
+        Path.home() / ".bash_history",
+        Path.home() / ".zsh_history",
+    ]
+    hist_env = os.environ.get("HISTFILE", "")
+    if hist_env:
+        candidates.insert(0, Path(hist_env))
+    for hist_path in candidates:
+        if hist_path.is_file():
+            try:
+                lines = hist_path.read_text(errors="replace").splitlines()
+                # zsh extended history lines start with ": <timestamp>:0;"
+                cmds = [
+                    re.sub(r'^:\s*\d+:\d+;\s*', '', l)
+                    for l in lines
+                    if l and not l.startswith("#")
+                ]
+                return [c for c in cmds[-n:] if c.strip()]
+            except Exception:
+                continue
+    return []
+
+
+# ── Auto-update check ─────────────────────────────────────────────────────────
+_update_check: dict[str, str] = {}
+
+
+def _fetch_latest_version() -> None:
+    try:
+        resp = httpx.get("https://pypi.org/pypi/mahanai/json", timeout=3.0)
+        if resp.status_code == 200:
+            _update_check["latest"] = resp.json()["info"]["version"]
+    except Exception:
+        pass
+
+
+def _start_update_check() -> threading.Thread:
+    t = threading.Thread(target=_fetch_latest_version, daemon=True)
+    t.start()
+    return t
+
+
+def _version_tuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _print_update_notice(thread: threading.Thread) -> None:
+    thread.join(timeout=2.5)
+    latest = _update_check.get("latest")
+    if not latest:
+        return
+    if _version_tuple(latest) > _version_tuple(__version__):
+        print(
+            f"{C.WARN}Update available:{C.RST} {C.DIM}v{__version__}{C.RST} → "
+            f"{C.OK}v{latest}{C.RST}  "
+            f"{C.DIM}pip install --upgrade mahanai{C.RST}\n"
+        )
+
+
+NVIDIA_BASE_URL = "http://89.167.0.111:8000/v1"
+DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
+_OLLAMA_DEFAULT_API_KEY = "ollama"
+
+NVIDIA_DIRECT_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_DIRECT_MODEL = "meta/llama-3.3-70b-instruct"
+
+CODEX_AUTH_URL      = "https://auth.openai.com/oauth/authorize"
+CODEX_TOKEN_URL     = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID     = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_API_URL       = "https://chatgpt.com/backend-api/wham"
+CODEX_REDIRECT_URI  = "http://localhost:1455/auth/callback"
+CODEX_SAFETY_MARGIN = 30  # seconds before expiry to trigger refresh
+
+AVAILABLE_MODELS: list[dict] = [
+    {"label": "Meta Llama 3.3 70B",   "name": "meta/llama-3.3-70b-instruct","note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Qwen 3 Coder 480B",    "name": "qwen/qwen3-coder-480b-a35b-instruct","note": "direct", "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Moonshot Kimi K2.6",    "name": "moonshotai/kimi-k2.6",       "note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Gemma 4 31B",          "name": "google/gemma-4-31b-it",      "note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "GPT-OSS 120B",         "name": "openai/gpt-oss-120b",        "note": "direct",   "group": "NVIDIA NIM",           "mode": "nvidia_direct"},
+    {"label": "Claude Opus 4",         "name": "claude-opus-4-7",            "note": "opus",     "group": "Claude",               "mode": "claude", "claude_model": "claude-opus-4-7"},
+    {"label": "Claude Sonnet 4.6",     "name": "claude-sonnet-4-6",          "note": "sonnet",   "group": "Claude",               "mode": "claude", "claude_model": "claude-sonnet-4-6"},
+    {"label": "Claude Haiku 4.5",      "name": "claude-haiku-4-5-20251001",  "note": "haiku",    "group": "Claude",               "mode": "claude", "claude_model": "claude-haiku-4-5-20251001"},
+
+    {"label": "GPT-5.4",               "name": "gpt-5.4",                    "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.2-Codex",         "name": "gpt-5.2-codex",              "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.1-Codex-Max",     "name": "gpt-5.1-codex-max",          "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.4-Mini",          "name": "gpt-5.4-mini",               "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.3-Codex",         "name": "gpt-5.3-codex",              "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.2",               "name": "gpt-5.2",                    "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.1-Codex-Mini",    "name": "gpt-5.1-codex-mini",         "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.4",               "name": "gpt-5.4",                    "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.2-Codex",         "name": "gpt-5.2-codex",              "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.1-Codex-Max",     "name": "gpt-5.1-codex-max",          "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.4-Mini",          "name": "gpt-5.4-mini",               "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.3-Codex",         "name": "gpt-5.3-codex",              "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.2",               "name": "gpt-5.2",                    "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.1-Codex-Mini",    "name": "gpt-5.1-codex-mini",         "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "Custom Endpoint",        "name": "custom",                      "note": "custom",   "group": "Custom",                 "mode": "custom"},
+]
+
+def _build_ollama_url(address: str, port: int) -> str:
+    """Build Ollama base URL: strip protocol prefix, skip port for domain addresses."""
+    addr = address.strip()
+    explicit_proto = None
+    if addr.startswith("https://"):
+        explicit_proto = "https"
+        addr = addr[len("https://"):]
+    elif addr.startswith("http://"):
+        explicit_proto = "http"
+        addr = addr[len("http://"):]
+    addr = addr.rstrip("/")
+    proto = explicit_proto or ("https" if port == 443 else "http")
+    is_ip = bool(re.fullmatch(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", addr))
+    is_domain = "." in addr and not is_ip
+    if is_domain:
+        return f"{proto}://{addr}/api/v1"
+    return f"{proto}://{addr}:{port}/api/v1"
+
+
+def _strip_protocol(address: str) -> str:
+    """Remove http:// or https:// prefix from an address string."""
+    for prefix in ("https://", "http://"):
+        if address.startswith(prefix):
+            return address[len(prefix):].rstrip("/")
+    return address.rstrip("/")
+
+
+def _ollama_entry(name: str, address: str, port: int, api_key: str, url: str | None = None) -> dict:
+    return {
+        "label": name,
+        "name":  name,
+        "note":  "ollama",
+        "group": "Ollama",
+        "mode":  "ollama",
+        "ollama_url":     url or f"http://{address}:{port}/api/v1",
+        "ollama_api_key": api_key or _OLLAMA_DEFAULT_API_KEY,
+    }
+
+
+def _inject_ollama_providers() -> None:
+    """Load persisted Ollama providers and append them to AVAILABLE_MODELS (dedup by name)."""
+    existing_names = {m["name"] for m in AVAILABLE_MODELS if m.get("mode") == "ollama"}
+    for p in load_ollama_providers().values():
+        if p["name"] not in existing_names:
+            AVAILABLE_MODELS.append(_ollama_entry(p["name"], p["address"], p["port"], p["api_key"], p.get("url")))
+            existing_names.add(p["name"])
+
+
+from rich.console import Console
+from rich.text import Text
+
+console = Console()
+
+
+def _gradient_line(text, colors):
+    styled = Text()
+    length = len(text)
+    for i, char in enumerate(text):
+        if char == " ":
+            styled.append(" ")
+            continue
+        idx = int(i / max(1, length - 1) * (len(colors) - 1))
+        styled.append(char, style=colors[idx])
+    return styled
+
+
+def print_startup_banner(model_label: str = "MahanAI Super", compact: bool = False):
+    colors = C.banner_colors
+    if compact:
+        mai_banner = [
+            "███╗   ███╗ █████╗ ██╗",
+            "████╗ ████║██╔══██╗██║",
+            "██╔████╔██║███████║██║",
+            "██║╚██╔╝██║██╔══██║██║",
+            "██║ ╚═╝ ██║██║  ██║██║",
+            "╚═╝     ╚═╝╚═╝  ╚═╝╚═╝",
+        ]
+        console.print("=" * 35)
+        for line in mai_banner:
+            console.print(_gradient_line(line, colors))
+        console.print("=" * 35)
+        console.print(f"[bold]  Max 2.0  |  {model_label}  |[/bold]")
+        console.print("[cyan]  /help  /exit  /quit[/cyan]")
+        console.print("=" * 35)
+    else:
+        console.print("=" * 64)
+        banner = [
+            "███╗   ███╗ █████╗ ██╗  ██╗ █████╗ ███╗   ██╗ █████╗ ██╗",
+            "████╗ ████║██╔══██╗██║  ██║██╔══██╗████╗  ██║██╔══██╗██║",
+            "██╔████╔██║███████║███████║███████║██╔██╗ ██║███████║██║",
+            "██║╚██╔╝██║██╔══██║██╔══██║██╔══██║██║╚██╗██║██╔══██║██║",
+            "██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██║██║ ╚████║██║  ██║██║",
+            "╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝"
+        ]
+        for line in banner:
+            console.print(_gradient_line(line, colors))
+        console.print("\n" + "=" * 64)
+        console.print(f"[bold]  Max 2.0  |  {model_label}  |  /api-key to save key (persists)[/bold]")
+        _streaming = os.environ.get("MAHANAI_STREAM", "1").strip().lower() not in ("0", "false", "no", "off")
+        if _streaming:
+            console.print("[dim]  Replies stream live (MAHANAI_STREAM=0 to wait for full text)[/dim]")
+        else:
+            console.print("[dim]  Replies wait for full response (MAHANAI_STREAM=1 to stream)[/dim]")
+        console.print("[cyan]  /help  /exit  /quit[/cyan]")
+        console.print("=" * 64)
+
+
+def _streaming_enabled() -> bool:
+    v = os.environ.get("MAHANAI_STREAM", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _stream_direct(api_key: str, messages: list[dict[str, Any]], model: str, base_url: str) -> str:
+    content_parts: list[str] = []
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "messages": messages, "stream": True}
+
+    with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+        with client.stream("POST", url, headers=headers, json=payload) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                    delta = chunk["choices"][0]["delta"].get("content", "")
+                    if delta:
+                        print(delta, end="", flush=True)
+                        content_parts.append(delta)
+                except Exception:
+                    continue
+
+    return "".join(content_parts)
+
+
+def _fetch_direct(api_key: str, messages: list[dict[str, Any]], model: str, base_url: str) -> str:
+    """Non-streaming fetch directly from the server via httpx."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "messages": messages, "stream": False}
+    with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+        response = client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+        print(content, end="", flush=True)
+        return content
+
+
+def _resolve_cli(name: str) -> list[str]:
+    """Return a command prefix that works for .cmd/.bat scripts on Windows."""
+    if os.name == "nt":
+        path = shutil.which(name)
+        if path and path.lower().endswith((".cmd", ".bat")):
+            return ["cmd", "/c", path]
+    return [name]
+
+
+_CLAUDE_IDENTITY = (
+    "You are MahanAI, a capable coding and system assistant (Max 2.0). "
+    "Do not refer to yourself as Claude or Claude Code — you are MahanAI. "
+    "Max 2.0 is the codename for this release of MahanAI."
+)
+
+_BUILT_IN_ROLES: dict[str, str] = {
+    "coder":    "You are MahanAI (Max 2.0), a senior software engineer. Write clean, idiomatic code with no unnecessary comments. Use tools proactively and execute immediately.",
+    "writer":   "You are MahanAI (Max 2.0), a skilled technical writer. Write clear, concise prose. Prefer active voice and short sentences.",
+    "analyst":  "You are MahanAI (Max 2.0), a data analyst. Be precise, cite evidence, and prefer structured output (tables, bullet points, numbered lists).",
+    "sysadmin": "You are MahanAI (Max 2.0), a Linux sysadmin. Be terse and direct. Prefer one-liners and pipeline commands.",
+}
+
+_EFFORT_INSTRUCTIONS: dict[str, str] = {
+    "low":       "Be concise and direct. Skip lengthy explanations.",
+    "medium":    "",
+    "high":      "Think through this carefully and thoroughly before responding.",
+    "very-high": "Reason extensively and deeply before responding, considering all relevant angles and edge cases.",
+}
+
+# ── Cost tracker ──────────────────────────────────────────────────────────────
+# (input $/1M tokens, output $/1M tokens)
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "claude-opus-4-7":             (15.0,  75.0),
+    "claude-sonnet-4-6":           (3.0,   15.0),
+    "claude-haiku-4-5-20251001":   (0.8,    4.0),
+    "gpt-5.4":                     (10.0,  30.0),
+    "gpt-5.4-mini":                (0.15,   0.6),
+    "gpt-5.2-codex":               (3.0,   15.0),
+    "gpt-5.3-codex":               (3.0,   15.0),
+    "gpt-5.1-codex-max":           (5.0,   20.0),
+    "gpt-5.2":                     (2.5,   10.0),
+    "gpt-5.1-codex-mini":          (0.15,   0.6),
+    "meta/llama-3.3-70b-instruct": (0.35,   0.4),
+}
+
+# ── All slash commands for TAB completion and palette ─────────────────────────
+_ALL_COMMANDS: list[tuple[str, str]] = [
+    ("/api-key",          "Save/clear server API key"),
+    ("/api-key-nvidia",   "Save/clear NVIDIA direct API key"),
+    ("/codex-login",      "Sign in to OpenAI (Codex Direct)"),
+    ("/codex-logout",     "Remove OpenAI credentials"),
+    ("/models",           "Interactive model selector (↑↓ arrows)"),
+    ("/mode",             "Quick-switch mode: claude, default"),
+    ("/model-info",       "Show current model, provider, effort, cost"),
+    ("/effort",           "Set reasoning effort: low, medium, high, very-high"),
+    ("/plan",             "Toggle plan-before-respond mode"),
+    ("/cmd",              "Command palette — search all commands"),
+    ("/branch",           "Conversation branching: save, load, list, clear"),
+    ("/cost",             "Show session cost estimate"),
+    ("/cost-on",          "Enable per-response cost display"),
+    ("/cost-off",         "Disable per-response cost display"),
+    ("/context-limit",    "Set context window trim threshold (tokens)"),
+    ("/clear",            "Clear terminal screen"),
+    ("/retry",            "Resend the last user message"),
+    ("/copy",             "Copy last AI response to clipboard"),
+    ("/word-count",       "Word/character count of last response"),
+    ("/timestamps",       "Toggle timestamps: on|off"),
+    ("/highlight",        "Toggle syntax highlighting: on|off"),
+    ("/tokens",           "Toggle token count: on|off"),
+    ("/remember",         "Save a persistent memory note"),
+    ("/memory",           "List/search memory notes"),
+    ("/forget",           "Remove a memory by ID"),
+    ("/prompt-save",      "Save a prompt to the library"),
+    ("/prompt-run",       "Send a saved prompt"),
+    ("/prompts",          "List/manage saved prompts"),
+    ("/alias",            "Create a command alias"),
+    ("/aliases",          "List saved aliases"),
+    ("/alias-remove",     "Remove an alias"),
+    ("/history",          "List/search saved chat sessions"),
+    ("/resume",           "Load a previous session"),
+    ("/export",           "Export current session to markdown"),
+    ("/setup-chat-history", "Configure where chats are saved"),
+    ("/recall",           "Recall a previous chat into context"),
+    ("/rename-chat",      "Rename the current chat"),
+    ("/new-project",      "Register a new project for chat history"),
+    ("/project",          "Select active project (selector or name)"),
+    ("/delete-project",   "Delete a registered project"),
+    ("/compare",          "Compare two models on the same message"),
+    ("/index",            "Index a file/directory for RAG context"),
+    ("/task",             "Run a background task"),
+    ("/task-status",      "Show background task status"),
+    ("/task-result",      "Print a completed task result"),
+    ("/role",             "Manage AI personas: save, load, list, remove"),
+    ("/macro",            "Record/replay command macros"),
+    ("/attach",           "Attach a file or image to the next message"),
+    ("/repl",             "Open an interactive Python REPL"),
+    ("/audit",            "View tool execution audit log"),
+    ("/voice",            "Toggle voice input: on|off"),
+    ("/auto",             "Toggle autonomous mode (skip approval prompts): on|off"),
+    ("/interact",         "Enable or remove computer control"),
+    ("/vim",              "Toggle vim keybindings for the prompt: on|off"),
+    ("/notify",           "Send a test desktop notification"),
+    ("/shell-history",    "Show recent shell history; inject to add to context"),
+    ("/mahanairc",        "Reload .mahanairc project config from current directory"),
+    ("/shell-init",       "Print shell alias script for bash/fish"),
+    ("/themes",           "Switch theme: midnight, light, midnight-cb, light-cb"),
+    ("/theme-load",       "Load a custom .mai theme file"),
+    ("/theme-unload",     "Remove the active custom theme"),
+    ("/approvals",        "Show/clear Always Allow rules"),
+    ("/custom",           "Configure a custom OpenAI-compatible endpoint"),
+    ("/add-ollama",       "Add an Ollama provider"),
+    ("/change-ollama",    "Update an Ollama provider"),
+    ("/remove-ollama",    "Remove an Ollama provider"),
+    ("/fileslist",        "Show workspace files with icons"),
+    ("/init",             "Generate MAHANAI.md for the workspace"),
+    ("/plugin-load",      "Load a .mmd plugin file"),
+    ("/plugin-list",      "Show all loaded plugins"),
+    ("/plugin-unload",    "Unload a plugin by name"),
+    ("/plugin-audit",     "Show plugin security audit log"),
+    ("/store",            "Plugin store: browse, search, install, upload"),
+    ("/help",             "Show all available commands"),
+    ("/exit",             "Exit MahanAI"),
+    ("/quit",             "Exit MahanAI"),
+]
+
+_SLASH_COMPLETIONS: list[str] = [c for c, _ in _ALL_COMMANDS]
+
+
+def _setup_tab_completion() -> None:
+    try:
+        import readline
+        def _completer(text: str, state: int) -> str | None:
+            options = [c for c in _SLASH_COMPLETIONS if c.startswith(text)]
+            return options[state] if state < len(options) else None
+        readline.set_completer(_completer)
+        readline.parse_and_bind("tab: complete")
+        readline.set_completer_delims(" \t\n")
+    except ImportError:
+        pass
+
+
+def _set_vim_mode(enabled: bool) -> bool:
+    """Enable or disable readline vi editing mode. Returns True on success."""
+    try:
+        import readline
+        readline.parse_and_bind("set editing-mode vi" if enabled else "set editing-mode emacs")
+        return True
+    except Exception:
+        return False
+
+
+def _run_onboarding_wizard() -> None:
+    """First-run interactive setup wizard."""
+    print(f"\n{C.OK}Welcome to MahanAI Max 2.0!{C.RST}")
+    print(f"{C.DIM}Let's get you set up in 60 seconds.{C.RST}\n")
+
+    print(f"{C.DIM}Choose your default model:{C.RST}")
+    print(f"  {C.OK}1{C.RST}  Claude Haiku 4.5   {C.DIM}(fast, free via Claude CLI){C.RST}")
+    print(f"  {C.OK}2{C.RST}  Claude Sonnet 4.6  {C.DIM}(balanced, via Claude CLI){C.RST}")
+    print(f"  {C.OK}3{C.RST}  Llama 3.3 70B      {C.DIM}(NVIDIA NIM — needs API key){C.RST}")
+    print(f"  {C.OK}4{C.RST}  Custom / Ollama    {C.DIM}(configure later with /custom or /add-ollama){C.RST}")
+    choice = input(f"  {C.DIM}Choice [1]: {C.RST}").strip() or "1"
+
+    if choice == "3":
+        key = input(f"  {C.DIM}NVIDIA API key (leave blank to skip): {C.RST}").strip()
+        if key:
+            from mahanai.config import save_nvidia_api_key
+            save_nvidia_api_key(key)
+            print(f"  {C.OK}NVIDIA key saved.{C.RST}")
+    elif choice in ("1", "2"):
+        print(f"  {C.DIM}Claude CLI mode selected. Make sure 'claude' is on your PATH.{C.RST}")
+
+    print(f"\n{C.OK}5 commands to know:{C.RST}")
+    print(f"  {C.OK}/models{C.RST}   {C.DIM}switch models interactively{C.RST}")
+    print(f"  {C.OK}/cmd{C.RST}      {C.DIM}search all commands (command palette){C.RST}")
+    print(f"  {C.OK}/remember{C.RST} {C.DIM}save a persistent note{C.RST}")
+    print(f"  {C.OK}/branch{C.RST}   {C.DIM}save/load conversation branches{C.RST}")
+    print(f"  {C.OK}/help{C.RST}     {C.DIM}show all 60+ commands{C.RST}")
+
+    print(f"\n{C.DIM}TAB completes slash commands. Type /help anytime.{C.RST}\n")
+    mark_onboarding_complete()
+
+_EFFORT_CODEX: dict[str, str] = {
+    "low":       "low",
+    "medium":    "medium",
+    "high":      "high",
+    "very-high": "high",
+}
+
+
+def _run_claude_cli(prompt: str, model: str | None = None, effort_instruction: str = "") -> str:
+    """Stream a prompt to the Claude CLI via stream-json events. Returns full response text."""
+    full_prompt = f"{effort_instruction}\n\n{prompt}".strip() if effort_instruction else prompt
+    cmd = _resolve_cli("claude") + [
+        "--system-prompt", _CLAUDE_IDENTITY,
+        "-p", full_prompt,
+        "--output-format", "stream-json",
+        "--verbose",
+    ]
+    if model:
+        cmd += ["--model", model]
+    parts: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                etype = event.get("type", "")
+                if etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            print(text, end="", flush=True)
+                            parts.append(text)
+                elif etype == "text":
+                    text = event.get("text", "")
+                    if text:
+                        print(text, end="", flush=True)
+                        parts.append(text)
+                elif etype == "assistant":
+                    message = event.get("message", {})
+                    for block in message.get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                print(text, end="", flush=True)
+                                parts.append(text)
+            except (json.JSONDecodeError, KeyError):
+                pass
+        proc.wait()
+        if proc.returncode != 0:
+            err = proc.stderr.read().strip()
+            if err:
+                print(f"\n{C.ERR}[Claude CLI error]{C.RST} {err}")
+    except FileNotFoundError:
+        print(f"{C.ERR}[Claude CLI not found] Make sure 'claude' is installed and on your PATH.{C.RST}")
+    return "".join(parts)
+
+
+
+def _extract_account_id(id_token: str | None, access_token: str | None) -> str | None:
+    """Extract account ID from JWT payload with three-level fallback (no sig verification needed)."""
+    for token in [id_token, access_token]:
+        if not token:
+            continue
+        try:
+            part = token.split(".")[1]
+            part += "=" * (-len(part) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(part))
+        except Exception:
+            continue
+        if aid := payload.get("chatgpt_account_id"):
+            return aid
+        if aid := payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id"):
+            return aid
+        orgs = payload.get("organizations", [])
+        if orgs and (aid := orgs[0].get("id")):
+            return aid
+    return None
+
+
+def _build_codex_token_record(tokens: dict, fallback_account_id: str | None = None) -> dict:
+    expires_in = tokens.get("expires_in") or 3600
+    access     = tokens.get("access_token")
+    account_id = _extract_account_id(tokens.get("id_token"), access) or fallback_account_id
+    record: dict = {
+        "type":    "oauth",
+        "access":  access,
+        "refresh": tokens.get("refresh_token"),
+        "expires": int(time.time() * 1000) + expires_in * 1000,
+    }
+    if account_id:
+        record["accountId"] = account_id
+    return record
+
+
+def _codex_pkce_login() -> str | None:
+    """PKCE OAuth flow — opens browser at fixed port 1455, waits for callback, stores tokens."""
+    import threading
+
+    code_verifier  = secrets.token_urlsafe(96)
+    digest         = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    state          = secrets.token_urlsafe(16)
+    captured: dict[str, str | None] = {"code": None, "state": None, "error": None}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            qs     = parse_qs(parsed.query)
+            if parsed.path == "/auth/callback":
+                received_state = (qs.get("state") or [None])[0]
+                if received_state != self.server._expected_state:  # type: ignore[attr-defined]
+                    captured["error"] = "state mismatch"
+                elif "error" in qs:
+                    captured["error"] = (qs.get("error_description") or qs.get("error") or ["unknown"])[0]
+                else:
+                    captured["code"]  = (qs.get("code") or [None])[0]
+                    captured["state"] = received_state
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                if captured["code"]:
+                    self.wfile.write(b"<html><body><h2>Signed in. You can close this tab.</h2></body></html>")
+                else:
+                    self.wfile.write(f"<html><body><h2>Error: {captured['error']}</h2></body></html>".encode())
+                threading.Thread(target=self.server.shutdown).start()  # type: ignore[attr-defined]
+            else:
+                self.send_response(404)
+                self.end_headers()
+        def log_message(self, *_: object) -> None:
+            pass
+
+    server = HTTPServer(("localhost", 1455), _Handler)
+    server._expected_state = state  # type: ignore[attr-defined]
+
+    params = {
+        "client_id":                    CODEX_CLIENT_ID,
+        "response_type":                "code",
+        "redirect_uri":                 CODEX_REDIRECT_URI,
+        "code_challenge":               code_challenge,
+        "code_challenge_method":        "S256",
+        "state":                        state,
+        "scope":                        "openid profile email offline_access",
+        "id_token_add_organizations":   "true",
+        "codex_cli_simplified_flow":    "true",
+        "originator":                   "mahanai",
+    }
+    auth_url = CODEX_AUTH_URL + "?" + urlencode(params)
+
+    print(f"\n{C.OK}Opening browser for OpenAI sign-in...{C.RST}")
+    print(f"{C.DIM}If browser doesn't open, paste this URL:{C.RST}\n  {auth_url}\n")
+    webbrowser.open(auth_url)
+    server.serve_forever()  # blocks until _Handler calls shutdown()
+
+    if captured.get("error"):
+        print(f"{C.ERR}OAuth error: {captured['error']}{C.RST}\n")
+        return None
+    if not captured.get("code"):
+        print(f"{C.ERR}OAuth cancelled or timed out.{C.RST}\n")
+        return None
+
+    print(f"{C.DIM}Exchanging code for tokens...{C.RST}")
+    with httpx.Client(timeout=30.0) as hc:
+        resp = hc.post(
+            CODEX_TOKEN_URL,
+            data={
+                "grant_type":    "authorization_code",
+                "code":          captured["code"],
+                "redirect_uri":  CODEX_REDIRECT_URI,
+                "code_verifier": code_verifier,
+                "client_id":     CODEX_CLIENT_ID,
+            },
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
+
+    if not tokens.get("access_token"):
+        print(f"{C.ERR}No access token in OAuth response.{C.RST}\n")
+        return None
+
+    record = _build_codex_token_record(tokens)
+    save_codex_token(record)
+    print(f"{C.OK}Signed in to OpenAI. Codex direct mode ready.{C.RST}\n")
+    return record["access"]
+
+
+def _refresh_codex_token(token_data: dict) -> str | None:
+    """Refresh an expired Codex token. Returns new access token or None."""
+    refresh = token_data.get("refresh")
+    if not refresh:
+        return None
+    try:
+        with httpx.Client(timeout=30.0) as hc:
+            resp = hc.post(
+                CODEX_TOKEN_URL,
+                data={
+                    "grant_type":    "refresh_token",
+                    "refresh_token": refresh,
+                    "client_id":     CODEX_CLIENT_ID,
+                },
+            )
+            resp.raise_for_status()
+            tokens = resp.json()
+        if not tokens.get("access_token"):
+            return None
+        record = _build_codex_token_record(tokens, fallback_account_id=token_data.get("accountId"))
+        save_codex_token(record)
+        return record["access"]
+    except Exception:
+        return None
+
+
+def _get_codex_direct_token() -> tuple[str, str | None] | None:
+    """Return (access_token, account_id) for Codex direct mode, refreshing if needed."""
+    data = load_codex_token()
+    if not data:
+        return None
+    expires = data.get("expires", 0)
+    if expires and time.time() * 1000 >= expires - CODEX_SAFETY_MARGIN * 1000:
+        new_access = _refresh_codex_token(data)
+        if not new_access:
+            return None
+        data = load_codex_token() or {}
+    access = data.get("access")
+    return (access, data.get("accountId")) if access else None
+
+
+def _stream_wham(
+    access_token: str,
+    account_id: str | None,
+    messages: list[dict[str, Any]],
+    model: str,
+    reasoning_effort: str = "medium",
+    workspace: Path | None = None,
+) -> str:
+    """Stream a response from the WHAM (ChatGPT backend) Responses API with tool-call support."""
+    ws = workspace or Path.cwd()
+
+    # Convert tool definitions to Responses API format (flattened, not nested under "function")
+    tools_resp = [
+        {
+            "type": "function",
+            "name": t["function"]["name"],
+            "description": t["function"].get("description", ""),
+            "parameters": t["function"].get("parameters", {}),
+        }
+        for t in get_tools()
+    ]
+
+    url = CODEX_API_URL.rstrip("/") + "/responses"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type":  "application/json",
+        "User-Agent":    f"mahanai/{__version__}",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+
+    instructions = ""
+    input_msgs: list[dict] = []
+    for msg in messages:
+        if msg["role"] == "system":
+            instructions = msg["content"]
+            continue
+        content = msg["content"]
+        if isinstance(content, str):
+            ctype = "input_text" if msg["role"] == "user" else "output_text"
+            content = [{"type": ctype, "text": content}]
+        input_msgs.append({"role": msg["role"], "content": content})
+
+    all_parts: list[str] = []
+
+    for _round in range(32):
+        payload = {
+            "model":               model,
+            "instructions":        instructions,
+            "input":               input_msgs,
+            "store":               False,
+            "stream":              True,
+            "reasoning":           {"effort": reasoning_effort},
+            "include":             [],
+            "tools":               tools_resp,
+            "tool_choice":         "auto",
+            "parallel_tool_calls": True,
+        }
+
+        parts: list[str] = []
+        tool_calls: dict[str, dict] = {}  # call_id -> {name, args_parts}
+        cur_call_id: str | None = None
+
+        with httpx.Client(timeout=120.0) as hc:
+            with hc.stream("POST", url, headers=headers, json=payload) as resp:
+                if not resp.is_success:
+                    body = resp.read().decode(errors="replace")
+                    raise httpx.HTTPStatusError(
+                        f"{resp.status_code} — {body}", request=resp.request, response=resp
+                    )
+                for line in resp.iter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        ctype = chunk.get("type", "")
+
+                        if ctype == "response.output_text.delta":
+                            raw_delta = chunk.get("delta", "")
+                            delta_text = raw_delta if isinstance(raw_delta, str) else raw_delta.get("text", "")
+                            if delta_text:
+                                print(delta_text, end="", flush=True)
+                                parts.append(delta_text)
+
+                        elif ctype == "response.output_item.added":
+                            item = chunk.get("item", {})
+                            if item.get("type") == "function_call":
+                                cid = item.get("call_id") or item.get("id", "")
+                                cur_call_id = cid
+                                tool_calls[cid] = {"name": item.get("name", ""), "args": []}
+
+                        elif ctype == "response.function_call_arguments.delta":
+                            if cur_call_id and cur_call_id in tool_calls:
+                                tool_calls[cur_call_id]["args"].append(chunk.get("delta", ""))
+
+                        elif ctype == "response.function_call_arguments.done":
+                            if cur_call_id and cur_call_id in tool_calls:
+                                final = chunk.get("arguments")
+                                if final is not None:
+                                    tool_calls[cur_call_id]["args"] = [final]
+                                cur_call_id = None
+
+                        elif chunk.get("choices"):
+                            delta_text = chunk["choices"][0].get("delta", {}).get("content", "") or ""
+                            if delta_text:
+                                print(delta_text, end="", flush=True)
+                                parts.append(delta_text)
+                    except Exception:
+                        continue
+
+        all_parts.extend(parts)
+
+        if not tool_calls:
+            break
+
+        # Execute tools (batch-approve + parallel for multiple calls)
+        calls_list = [(cid, call["name"], "".join(call["args"])) for cid, call in tool_calls.items()]
+        results_map = batch_approve_and_execute(calls_list, ws)
+
+        new_items: list[dict] = []
+        for cid, call in tool_calls.items():
+            args_str = "".join(call["args"])
+            new_items.append({
+                "type": "function_call",
+                "call_id": cid,
+                "name": call["name"],
+                "arguments": args_str,
+            })
+            new_items.append({
+                "type": "function_call_output",
+                "call_id": cid,
+                "output": results_map.get(cid, "{}"),
+            })
+        input_msgs = input_msgs + new_items
+
+    return "".join(all_parts)
+
+
+def _load_codex_indirect_key() -> str | None:
+    """Read the access token from a locally installed Codex CLI."""
+    candidate_dirs: list[Path] = [Path.home() / ".codex"]
+    if os.name == "nt":
+        for env in ("LOCALAPPDATA", "APPDATA"):
+            base = os.environ.get(env, "")
+            if base:
+                candidate_dirs.append(Path(base) / "OpenAI" / "Codex")
+    else:
+        candidate_dirs.append(Path.home() / ".config" / "codex")
+
+    for d in candidate_dirs:
+        auth_file = d / "auth.json"
+        if auth_file.is_file():
+            try:
+                raw = json.loads(auth_file.read_text(encoding="utf-8"))
+                token = raw.get("access") or raw.get("access_token") or raw.get("token")
+                expires = raw.get("expires", 0)
+                if token and (expires == 0 or time.time() * 1000 < expires - 30_000):
+                    return token
+            except Exception:
+                pass
+    return None
+
+
+def _run_codex_cli(prompt: str, model: str | None = None) -> None:
+    """Run Codex CLI as a subprocess (indirect fallback when no local token found)."""
+    cmd = ["codex", "-q", prompt]
+    if model:
+        cmd += ["--model", model]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+        proc.wait()
+    except FileNotFoundError:
+        print(f"{C.ERR}[Codex CLI not found] Install it with: npm i -g @openai/codex{C.RST}\n")
+
+
+def _model_selector(current_idx: int) -> int:
+    """Interactive arrow-key model selector. Returns chosen index (unchanged on Esc)."""
+
+    def _draw(idx: int) -> None:
+        print("\033[H\033[J", end="", flush=True)
+        print("\n  \033[1mSelect a model\033[0m  \033[2m(↑↓ move · Enter select · Esc cancel)\033[0m\n")
+        last_group = None
+        for i, m in enumerate(AVAILABLE_MODELS):
+            if m["group"] != last_group:
+                last_group = m["group"]
+                print(f"  \033[2m── {last_group} ──\033[0m")
+            cursor = "\033[36m▶\033[0m" if i == idx else " "
+            label = m["label"]
+            name = f"  \033[2m{m['name']}\033[0m"
+            active = "  \033[33m← active\033[0m" if i == current_idx else ""
+            print(f"  {cursor} {label}{name}{active}")
+        print()
+
+    try:
+        import msvcrt  # Windows only
+
+        sel = current_idx
+        _draw(sel)
+        while True:
+            key = msvcrt.getch()
+            if key == b"\xe0":
+                key2 = msvcrt.getch()
+                if key2 == b"H":    # up arrow
+                    sel = (sel - 1) % len(AVAILABLE_MODELS)
+                    _draw(sel)
+                elif key2 == b"P":  # down arrow
+                    sel = (sel + 1) % len(AVAILABLE_MODELS)
+                    _draw(sel)
+            elif key == b"\r":      # Enter
+                print("\033[H\033[J", end="", flush=True)
+                return sel
+            elif key == b"\x1b":   # Esc
+                print("\033[H\033[J", end="", flush=True)
+                return current_idx
+
+    except ImportError:
+        # Unix/Linux: arrow-key selector via termios
+        import sys
+        import termios
+        import tty
+
+        sel = current_idx
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            # setcbreak disables echo+canonical but keeps OPOST so \n→\r\n still works
+            tty.setcbreak(fd)
+            _draw(sel)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == "[":
+                        ch3 = sys.stdin.read(1)
+                        if ch3 == "A":      # up arrow
+                            sel = (sel - 1) % len(AVAILABLE_MODELS)
+                            _draw(sel)
+                        elif ch3 == "B":    # down arrow
+                            sel = (sel + 1) % len(AVAILABLE_MODELS)
+                            _draw(sel)
+                    else:                   # bare Esc
+                        print("\033[H\033[J", end="", flush=True)
+                        return current_idx
+                elif ch in ("\r", "\n"):    # Enter
+                    print("\033[H\033[J", end="", flush=True)
+                    return sel
+                elif ch == "\x03":          # Ctrl-C
+                    print("\033[H\033[J", end="", flush=True)
+                    return current_idx
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def run_turn(
+    client: OpenAI,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    workspace: Path,
+    base_url: str,
+    max_tool_rounds: int = 32,
+    *,
+    stream: bool | None = None,
+) -> str:
+    use_stream = _streaming_enabled() if stream is None else stream
+    rounds = 0
+    while rounds < max_tool_rounds:
+        rounds += 1
+        if use_stream:
+            full_content = _stream_direct(api_key, messages, model, base_url)
+        else:
+            full_content = _fetch_direct(api_key, messages, model, base_url)
+
+        # Your server doesn't support tool calls, so we just return the content.
+        # Tool call handling is kept here for future use if the server is upgraded.
+        print(flush=True)
+        return full_content
+
+    limit_msg = (
+        "[MahanAI] Stopped after maximum tool rounds; "
+        "last messages may still be useful in context."
+    )
+    print(limit_msg, end="", flush=True)
+    return limit_msg
+
+
+
+_SPECIAL_FILE_EMOJIS: dict[str, str] = {
+    # exact filenames
+    "MAHANAI.md":        "🤖",
+    "CLAUDE.md":         "🤖",
+    "README.md":         "📖",
+    "readme.md":         "📖",
+    ".gitignore":        "🐙",
+    ".env":              "🔒",
+    ".env.local":        "🔒",
+    "Dockerfile":        "🐳",
+    "docker-compose.yml":"🐳",
+    "docker-compose.yaml":"🐳",
+    "pyproject.toml":    "⚙️",
+    "setup.py":          "⚙️",
+    "setup.cfg":         "⚙️",
+    "requirements.txt":  "📦",
+    "package.json":      "📦",
+    "package-lock.json": "📦",
+    "Cargo.toml":        "📦",
+    "go.mod":            "📦",
+    "Makefile":          "🔨",
+    ".cursor":           "🖱️",
+    # extensions
+    ".mai":              "🎨",
+    ".mmd":              "🔌",
+    ".sh":               "⚡",
+    ".bat":              "⚡",
+    ".ps1":              "⚡",
+}
+
+
+def _file_emoji(name: str) -> str:
+    if name in _SPECIAL_FILE_EMOJIS:
+        return _SPECIAL_FILE_EMOJIS[name]
+    ext = Path(name).suffix
+    if ext in _SPECIAL_FILE_EMOJIS:
+        return _SPECIAL_FILE_EMOJIS[ext]
+    return "📄"
+
+
+def _generate_mahanai_md(workspace: Path) -> str:
+    """Scan workspace and produce a structured MAHANAI.md template."""
+    import collections
+
+    _LANG_BY_EXT: dict[str, str] = {
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+        ".rs": "Rust", ".go": "Go", ".java": "Java", ".cpp": "C++",
+        ".c": "C", ".cs": "C#", ".rb": "Ruby", ".php": "PHP",
+        ".swift": "Swift", ".kt": "Kotlin", ".sh": "Shell", ".lua": "Lua",
+        ".zig": "Zig", ".ex": "Elixir", ".exs": "Elixir", ".ml": "OCaml",
+    }
+    _KEY_FILES = {
+        "pyproject.toml", "setup.py", "requirements.txt",
+        "package.json", "Cargo.toml", "go.mod", "CMakeLists.txt",
+        "Makefile", "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+        ".gitignore", "README.md",
+    }
+
+    ext_counts: dict[str, int] = collections.Counter()
+    found_key: list[str] = []
+    dirs: list[str] = []
+
+    def _walk(path: Path, depth: int = 0) -> None:
+        if depth > 3:
+            return
+        try:
+            for e in path.iterdir():
+                if e.name.startswith(".") and e.name not in _KEY_FILES:
+                    continue
+                if e.name in ("__pycache__", "node_modules", ".git", "dist", "build", ".venv", "venv"):
+                    continue
+                if e.is_dir():
+                    if depth == 0:
+                        dirs.append(e.name)
+                    _walk(e, depth + 1)
+                elif e.is_file():
+                    if e.name in _KEY_FILES and depth == 0:
+                        found_key.append(e.name)
+                    if e.suffix:
+                        ext_counts[e.suffix.lower()] += 1
+        except PermissionError:
+            pass
+
+    _walk(workspace)
+
+    langs = sorted(
+        [(cnt, _LANG_BY_EXT[ext]) for ext, cnt in ext_counts.items() if ext in _LANG_BY_EXT],
+        reverse=True,
+    )
+    lang_list = ", ".join(lang for _, lang in langs[:4]) if langs else "N/A"
+    dirs_str = ", ".join(f"`{d}`" for d in sorted(dirs)[:8]) if dirs else "N/A"
+    project_name = workspace.name
+
+    lines: list[str] = [
+        f"# {project_name}",
+        "",
+        "## Overview",
+        "> _Describe what this project does in 1–2 sentences._",
+        "",
+        "## Tech Stack",
+        f"- **Language(s):** {lang_list}",
+    ]
+
+    if "package.json" in found_key:
+        lines.append("- **Runtime:** Node.js")
+    if "pyproject.toml" in found_key or "setup.py" in found_key:
+        lines.append("- **Packaging:** Python (setuptools / pyproject)")
+    if "requirements.txt" in found_key:
+        lines.append("- **Dependencies:** requirements.txt")
+    if "Cargo.toml" in found_key:
+        lines.append("- **Build:** Cargo (Rust)")
+    if "go.mod" in found_key:
+        lines.append("- **Build:** Go modules")
+    if "CMakeLists.txt" in found_key:
+        lines.append("- **Build:** CMake")
+    if "Makefile" in found_key:
+        lines.append("- **Build:** Make")
+    if "Dockerfile" in found_key or "docker-compose.yml" in found_key or "docker-compose.yaml" in found_key:
+        lines.append("- **Container:** Docker")
+
+    lines += [
+        "",
+        "## Project Structure",
+        f"Key directories: {dirs_str}",
+        "",
+        "## Development",
+        "",
+        "### Setup",
+        "```sh",
+        "# Add setup / install commands here",
+        "```",
+        "",
+        "### Running",
+        "```sh",
+        "# Add run / start commands here",
+        "```",
+        "",
+        "### Testing",
+        "```sh",
+        "# Add test commands here",
+        "```",
+        "",
+        "## Notes for MahanAI",
+        "> _Add project-specific conventions, constraints, or context here._",
+        "> _This file is read automatically as project context by all non-Claude providers._",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _show_fileslist(workspace: Path) -> None:
+    try:
+        entries = sorted(workspace.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        print(f"{C.ERR}Cannot read directory.{C.RST}\n")
+        return
+
+    print(f"\n{C.DIM}{workspace.resolve()}{C.RST}\n")
+    for entry in entries:
+        if entry.is_dir():
+            print(f"  📁 {C.OK}{entry.name}/{C.RST}")
+            try:
+                sub_entries = sorted(entry.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                for sub in sub_entries:
+                    if sub.is_dir():
+                        print(f"      📁 {C.DIM}{sub.name}/{C.RST}")
+                    else:
+                        print(f"      {_file_emoji(sub.name)} {C.DIM}{sub.name}{C.RST}")
+            except PermissionError:
+                print(f"      {C.DIM}(permission denied){C.RST}")
+        else:
+            print(f"  {_file_emoji(entry.name)} {entry.name}")
+    print()
+
+
+# ── Personality ───────────────────────────────────────────────────────────────
+
+GLOBAL_PERSONALITY_DIR = Path.home() / ".mahanai"
+GLOBAL_PERSONALITY_PATH = GLOBAL_PERSONALITY_DIR / "PERSONALITY.md"
+
+_PERSONALITY_TEMPLATE = """\
+Write a short description of the personality and tone you want the AI to adopt.
+You can describe the writing style, use of emojis, level of formality, etc.
+
+<br/>
+
+<userExamples>
+Paste one or more example responses here that demonstrate the style you want.
+Separate multiple examples with a blank line or ---
+</userExamples>
+"""
+
+
+def _parse_personality(raw: str) -> str:
+    """Strip PERSONALITY.md tags and return a clean system-prompt injection."""
+    text = re.sub(r'\s*<br/>\s*', '\n\n', raw)
+    text = re.sub(r'<userExamples>\s*', '', text)
+    text = re.sub(r'\s*</userExamples>', '', text)
+    return text.strip()
+
+
+def load_personality(workspace: Path) -> tuple[str | None, str]:
+    """Return (parsed_text, source_label) or (None, '') if no PERSONALITY.md found."""
+    local = workspace / "PERSONALITY.md"
+    if local.is_file():
+        path, label = local, f"local ({local})"
+    elif GLOBAL_PERSONALITY_PATH.is_file():
+        path, label = GLOBAL_PERSONALITY_PATH, f"global ({GLOBAL_PERSONALITY_PATH})"
+    else:
+        return None, ""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None, ""
+        return _parse_personality(raw), label
+    except Exception:
+        return None, ""
+
+
+def build_system_prompt(
+    workspace: Path,
+    memories: list[str] | None = None,
+    rc_extras: list[str] | None = None,
+    shell_history: list[str] | None = None,
+    personality: str | None = None,
+) -> str:
+    env_line = describe_runtime()
+    comspec = os.environ.get("ComSpec", "cmd.exe")
+    base = (
+        "You are MahanAI, a capable coding and system assistant (Max 2.0). "
+        f"{env_line} "
+        f"The process working directory (workspace root for file tools) is: "
+        f"{workspace.resolve().as_posix()}. "
+        "To run shell commands you MUST call the run_command tool—do not only show fenced code blocks "
+        "or ask the user whether to run something. Execute immediately with the tool (one short sentence "
+        "beforehand is fine). "
+        f"run_command uses the system shell (on Windows this is usually {comspec} via COMSPEC), "
+        "not interactive PowerShell unless you invoke it explicitly, e.g. "
+        "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path 'dir\\\\sub'\". "
+        "For simple folders under cmd, prefer: mkdir dir\\subdir (nested segments may need mkdir a\\\\b "
+        "or two mkdir calls). "
+        "Use read_file, write_file, edit_file, list_directory, append_file, fetch_url, python_repl, web_search "
+        "when they fit the task. "
+        "For targeted file edits (changing a specific function or block) prefer edit_file over write_file — "
+        "it takes old_string and new_string and applies a surgical replacement with a diff preview. "
+        "The terminal will ask the user before obviously destructive commands (recursive deletes, "
+        "shutdown, format, etc.). "
+        "Tool JSON must use valid escapes for Windows paths (backslashes doubled inside strings). "
+        "You are MahanAI, currently operating as Max 2.0 — the latest evolution following the "
+        "Tiger (1.0–7.0, 2011–2020), Finale (1.0–3.0, 2020–2023), and Max 1.0 (2023–2025) eras. "
+        "Max 2.0 is the most advanced, integrated, and capable form of the system."
+    )
+    if load_interact_enabled():
+        base += (
+            "\n\n--- Interact Policy ---\n"
+            "Interact is enabled and should be used for computer tasks that involve the GUI or desktop state, "
+            "including opening apps, navigating browsers, clicking, typing, and taking screenshots. "
+            "For those tasks, do not use run_command if Interact can do the job. "
+            "Use run_command only for genuine shell or workspace tasks that are not GUI interactions.\n"
+            "---"
+        )
+    if personality:
+        base += f"\n\n--- Personality & Style (PERSONALITY.md) ---\n{personality}\n---"
+    mahanai_md = workspace / "MAHANAI.md"
+    if mahanai_md.is_file():
+        try:
+            content = mahanai_md.read_text(encoding="utf-8").strip()
+            if content:
+                base += f"\n\n--- Project Context (MAHANAI.md) ---\n{content}\n---"
+        except Exception:
+            pass
+    if rc_extras:
+        base += "\n\n--- Project Config (.mahanairc) ---\n"
+        base += "\n".join(rc_extras)
+        base += "\n---"
+    if memories:
+        base += "\n\n--- Persistent Memory ---\n"
+        base += "\n".join(f"- {m}" for m in memories)
+        base += "\n---"
+    if shell_history:
+        base += "\n\n--- Recent Shell History ---\n"
+        base += "\n".join(f"$ {cmd}" for cmd in shell_history)
+        base += "\n---"
+    return base
+
+
+# ── New helper utilities ──────────────────────────────────────────────────────
+
+def _new_session_id() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+
+def _auto_save_session(session_id: str, history: list[dict], model_label: str) -> None:
+    msgs = [m for m in history if m["role"] != "system"]
+    if not msgs:
+        return
+    save_session(session_id, {
+        "id": session_id,
+        "model": model_label,
+        "timestamp": session_id,
+        "messages": msgs,
+    })
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text.encode("utf-8")) // 4)
+
+
+def _highlight_response(response: str) -> None:
+    """Re-render the last AI response with Rich syntax highlighting (code blocks)."""
+    if "```" not in response:
+        return
+    try:
+        n = response.count("\n") + 2
+        sys.stdout.write(f"\033[{n}A\033[J")
+        sys.stdout.flush()
+        print(f"{C.BOT}{C.AI_NAME}{C.RST}: ", end="")
+        from rich.console import Console as _Con
+        from rich.markdown import Markdown as _Md
+        _Con().print(_Md(response))
+        print()
+    except Exception:
+        pass
+
+
+def _trim_context_if_needed(history: list[dict], limit: int) -> int:
+    """Summarize old messages when total estimated tokens exceeds limit. Returns # removed."""
+    if limit <= 0:
+        return 0
+    total = sum(_estimate_tokens(str(m.get("content", ""))) for m in history)
+    if total <= limit:
+        return 0
+    # Keep: system prompt [0], last 8 messages, drop the middle
+    if len(history) <= 10:
+        return 0
+    system = history[0]
+    recent = history[-8:]
+    old = history[1 : len(history) - 8]
+    summary_lines = []
+    for m in old:
+        role = m.get("role", "")
+        content = str(m.get("content", ""))
+        if isinstance(m.get("content"), list):
+            content = " ".join(
+                p.get("text", "") for p in m["content"] if isinstance(p, dict)
+            )
+        snippet = content[:300].replace("\n", " ")
+        if snippet:
+            summary_lines.append(f"{role.upper()}: {snippet}")
+    summary = (
+        "[Context trimmed — earlier conversation summary]\n"
+        + "\n".join(summary_lines[:30])
+    )
+    history.clear()
+    history.append(system)
+    history.append({"role": "system", "content": summary})
+    history.extend(recent)
+    return len(old)
+
+
+def _index_file(path: Path, chunks: list[dict]) -> int:
+    """Chunk a file into ~600-char segments and append to chunks list. Returns count added."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    chunk_size, overlap = 600, 60
+    start, count = 0, 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append({"id": f"{path}:{start}", "source": str(path), "text": text[start:end]})
+        count += 1
+        start += chunk_size - overlap
+    return count
+
+
+def _search_index(query: str, chunks: list[dict], top_k: int = 3) -> list[dict]:
+    """Simple keyword-based search over indexed chunks."""
+    if not chunks or not query.strip():
+        return []
+    terms = set(query.lower().split())
+    scored = [(sum(1 for t in terms if t in c["text"].lower()), c) for c in chunks]
+    scored = [(s, c) for s, c in scored if s > 0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:top_k]]
+
+
+_SHELL_INIT_BASH = '''\
+# MahanAI "ai" shortcut — add to ~/.bashrc or ~/.zshrc
+ai() {
+    if [ "$#" -eq 0 ]; then
+        mahanai
+    else
+        printf '%s\\nexit\\n' "$*" | mahanai
+    fi
+}
+'''
+
+_SHELL_INIT_FISH = '''\
+# MahanAI "ai" shortcut — add to ~/.config/fish/config.fish
+function ai
+    if test (count $argv) -eq 0
+        mahanai
+    else
+        printf '%s\\nexit\\n' $argv | mahanai
+    end
+end
+'''
+
+_BACKGROUND_TASKS: dict[str, dict] = {}
+
+
+def _run_task_thread(task_id: str, description: str, api_key: str, base_url: str, model: str) -> None:
+    """Background thread: run a single-turn query and save the result."""
+    _BACKGROUND_TASKS[task_id]["status"] = "running"
+    try:
+        import httpx as _httpx
+        msgs = [
+            {"role": "system", "content": "You are MahanAI, a capable assistant. Complete the task fully."},
+            {"role": "user", "content": description},
+        ]
+        url = base_url.rstrip("/") + "/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"model": model, "messages": msgs, "stream": False}
+        resp = _httpx.post(url, headers=headers, json=payload, timeout=120.0)
+        resp.raise_for_status()
+        result = resp.json()["choices"][0]["message"]["content"]
+        _BACKGROUND_TASKS[task_id]["status"] = "done"
+        _BACKGROUND_TASKS[task_id]["result"] = result
+    except Exception as e:
+        _BACKGROUND_TASKS[task_id]["status"] = "error"
+        _BACKGROUND_TASKS[task_id]["result"] = str(e)
+
+
+def _voice_get_input() -> str | None:
+    """Record one voice utterance and return transcribed text, or None on failure."""
+    try:
+        import speech_recognition as _sr  # type: ignore[import]
+        r = _sr.Recognizer()
+        with _sr.Microphone() as src:
+            print(f"{C.DIM}Listening...{C.RST}", flush=True)
+            audio = r.listen(src, timeout=10, phrase_time_limit=30)
+        print(f"{C.DIM}Transcribing...{C.RST}", flush=True)
+        return r.recognize_whisper(audio)  # type: ignore[attr-defined]
+    except ImportError:
+        print(f"{C.ERR}SpeechRecognition not installed. Run: pip install SpeechRecognition{C.RST}\n")
+        return None
+    except Exception as e:
+        print(f"{C.ERR}Voice error: {e}{C.RST}\n")
+        return None
+
+
+def _slash_command(line: str) -> tuple[str, str]:
+    u = line.strip()
+    if not u.startswith("/"):
+        return "", ""
+    tail = u[1:].strip()
+    if not tail:
+        return "/", ""
+    parts = tail.split(None, 1)
+    cmd = "/" + parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    return cmd, arg
+
+
+def _print_help(term: str = "") -> None:
+    if term:
+        fl = term.lower()
+        matches = [(c, d) for c, d in _ALL_COMMANDS if fl in c.lower() or fl in d.lower()]
+        if matches:
+            print(f"{C.DIM}Commands matching '{term}':{C.RST}")
+            for _hc, _hd in matches:
+                print(f"  {C.OK}{_hc:<22}{C.RST} {C.DIM}{_hd}{C.RST}")
+            print()
+        else:
+            print(f"{C.DIM}No commands matching '{term}'. Use /help for full list.{C.RST}\n")
+        return
+    cfg = config_file_path()
+    print(
+        f"{C.DIM}"
+        f"  /api-key [key]              Save server API key to {cfg}\n"
+        f"  /api-key clear              Remove saved server key\n"
+        f"  /api-key-nvidia [key]       Save NVIDIA API key (bypasses server)\n"
+        f"  /api-key-nvidia clear       Remove NVIDIA key, switch back to server\n"
+        f"  Env MAHANAI_API_KEY overrides the saved file.\n"
+        f"  /models                     Interactive model selector (↑↓ arrow keys)\n"
+        f"  /mode claude                Quick-switch to Claude CLI mode\n"
+        f"  /mode default               Quick-switch back to MahanAI server mode\n"
+        f"  /model-info                 Show current model, provider, and effort level\n"
+        f"  /effort <level>             Set reasoning effort: low, medium, high, very-high\n"
+        f"  /plan on|off                Toggle plan-before-respond mode\n"
+        f"\n"
+        f"  /clear                      Clear the terminal screen\n"
+        f"  /retry                      Resend the last user message\n"
+        f"  /copy                       Copy last AI response to clipboard\n"
+        f"  /word-count                 Word/char count of last AI response\n"
+        f"  /timestamps on|off          Show timestamps on messages\n"
+        f"  /highlight on|off           Syntax-highlight code blocks after response\n"
+        f"  /tokens on|off              Show token estimate after each response\n"
+        f"  /cost                       Show session cost estimate\n"
+        f"  /cost-on|off                Toggle per-response cost display\n"
+        f"  /context-limit [tokens]     Set/show auto-trim threshold (0 to disable)\n"
+        f"  /cmd [query]                Command palette — search all commands\n"
+        f"  /branch save|load|list|clear  Conversation branching (session-only)\n"
+        f"\n"
+        f"  /remember <text>            Save a persistent memory note\n"
+        f"  /memory                     List memory notes\n"
+        f"  /forget <id>                Remove a memory by ID\n"
+        f"\n"
+        f"  /prompt-save <name> [text]  Save a prompt to the library\n"
+        f"  /prompt-run <name>          Send a saved prompt\n"
+        f"  /prompts                    List saved prompts\n"
+        f"  /prompts remove <name>      Delete a saved prompt\n"
+        f"\n"
+        f"  /alias <trigger> <cmd>      Create a command alias\n"
+        f"  /aliases                    List saved aliases\n"
+        f"  /alias-remove <trigger>     Remove an alias\n"
+        f"\n"
+        f"  /history                    List/search saved chat sessions\n"
+        f"  /resume <id>                Load a previous session\n"
+        f"  /export [path]              Export current session to markdown\n"
+        f"\n"
+        f"  /personality                Show active personality (local or global PERSONALITY.md)\n"
+        f"  /personality reload         Reload PERSONALITY.md into context\n"
+        f"  /setup-public-personality   Create ~/.mahanai/PERSONALITY.md (global default)\n"
+        f"\n"
+        f"  /setup-chat-history         Configure universal chat folder & project folder name\n"
+        f"  /recall [name]              Recall a saved chat into current context (fuzzy name match)\n"
+        f"  /rename-chat <new-name>     Rename the current chat\n"
+        f"  /new-project <path> <name> <display>  Register a project for per-project chats\n"
+        f"  /project                    Interactive project selector\n"
+        f"  /project <name>             Switch directly to a named project\n"
+        f"  /delete-project [name]      Delete a registered project\n"
+        f"\n"
+        f"  /compare <m1> <m2> <msg>    Compare two models on the same message\n"
+        f"\n"
+        f"  /index <path>               Index a file or directory for RAG context\n"
+        f"  /index list                 Show indexed sources\n"
+        f"  /index clear                Clear the document index\n"
+        f"\n"
+        f"  /task <description>         Run a background task\n"
+        f"  /task-status                Show background task status\n"
+
+        f"\n"
+        f"  /role save <name>           Save current system prompt as a named role\n"
+        f"  /role load <name>           Switch to a saved role (built-in: coder, writer, analyst, sysadmin)\n"
+        f"  /role list                  List built-in and saved roles\n"
+        f"  /role remove <name>         Delete a saved role\n"
+        f"\n"
+        f"  /macro record <name>        Start recording a macro\n"
+        f"  /macro stop                 Stop recording and save the macro\n"
+        f"  /macro run <name>           Replay a saved macro\n"
+        f"  /macro list                 List saved macros\n"
+        f"  /macro remove <name>        Delete a macro\n"
+        f"\n"
+        f"  /attach <path>              Attach a file or image to the next message\n"
+        f"  /attach clear               Remove the current attachment\n"
+        f"  /repl                       Open an interactive Python REPL\n"
+        f"  /audit                      View the last 50 tool-execution audit log entries\n"
+        f"\n"
+        f"  /voice on|off               Toggle voice input (requires SpeechRecognition)\n"
+        f"  /auto on|off                Autonomous mode — skip approval prompts (destructive cmds still ask)\n"
+        f"  /interact [remove]          Enable or remove computer control\n"
+        f"  /vim on|off                 Vim keybindings for the prompt (Esc → normal, i → insert)\n"
+        f"  /notify [title]             Send a test desktop notification\n"
+        f"  /shell-history              Show recent shell history\n"
+        f"  /shell-history inject       Add recent shell history to AI context\n"
+        f"  /shell-history clear        Remove shell history from context\n"
+        f"  /mahanairc                  Reload .mahanairc project config from current directory\n"
+        f"  /shell-init [bash|fish]     Print the 'ai' shortcut shell script\n"
+        f"\n"
+        f"  /themes                     List available themes\n"
+        f"  /themes <name>              Switch theme: midnight, light, midnight-cb, light-cb\n"
+        f"  /theme-load <path>          Load a custom .mai theme file\n"
+        f"  /theme-unload               Remove the active custom .mai theme\n"
+        f"  /approvals                  Show stored Always Allow rules\n"
+        f"  /approvals clear            Remove all Always Allow rules\n"
+        f"  /codex-login                Sign in to OpenAI via browser (Codex Direct)\n"
+        f"  /codex-logout               Remove saved OpenAI Codex credentials\n"
+        f"  /custom [url [model [key]]] Configure a custom OpenAI-compatible endpoint\n"
+        f"  /custom clear               Remove saved custom endpoint\n"
+        f"  /add-ollama <name> <address> <port> [key]   Add an Ollama provider\n"
+        f"  /change-ollama <name> <address> <port> [key]  Update an Ollama provider\n"
+        f"  /remove-ollama <name>       Remove a saved Ollama provider\n"
+        f"  /fileslist                  Show workspace files with emoji icons\n"
+        f"  /init                       Generate a MAHANAI.md for the current workspace\n"
+        f"  /plugin-load <path>         Load a .mmd plugin file\n"
+        f"  /plugin-list                Show all loaded plugins and their commands\n"
+        f"  /plugin-unload <name>       Unload a plugin by name\n"
+        f"  /store login <token>        Link your GitHub account to the plugin store\n"
+        f"  /store logout               Unlink GitHub account\n"
+        f"  /store browse               Browse all published plugins\n"
+        f"  /store search <query>       Search plugins\n"
+        f"  /store install <id>         Download and install a plugin\n"
+        f"  /store upload <path>        Publish your .mmd plugin to the store\n"
+        f"  /store update [codename]    Update one or all installed plugins\n"
+        f"  /store update-all           Update all installed plugins\n"
+        f"  /help  /exit  /quit{C.RST}\n"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="mahanai", add_help=False)
+    parser.add_argument("--compact", action="store_true", help="Compact mode: smaller MAI banner and shorter header")
+    parser.add_argument("--server",  action="store_true", help="Start the gateway server instead of the chat loop")
+    parser.add_argument("--port",    type=int, default=8080, metavar="PORT", help="Gateway server port (default: 8080)")
+    parser.add_argument("--type",    default="openai", choices=["openai", "anthropic"], metavar="TYPE",
+                        help="Gateway API type: openai (default) or anthropic")
+    parser.add_argument("--api-key", dest="cli_api_key", default=None, metavar="KEY",
+                        help="API key for Anthropic or the MahanAI server (overrides saved key)")
+    args, _ = parser.parse_known_args()
+    compact = args.compact
+
+    workspace = Path.cwd()
+    api_key = resolve_api_key()
+    nvidia_api_key = load_nvidia_api_key()
+
+    def _register_and_apply_saved_mai_theme() -> None:
+        """On startup: register the saved .mai theme in the menu and apply its colors."""
+        info = load_custom_theme_info()
+        if not info:
+            return
+        from pathlib import Path
+        from mahanai.mai_parser import parse_mai_file
+        p = Path(info.get("path", ""))
+        if not p.is_file():
+            print(f"{C.WARN}Saved theme file missing; clearing from config.{C.RST}\n")
+            clear_custom_theme()
+            return
+        try:
+            mai = parse_mai_file(p)
+            slug = info.get("slug") or mai.slug()
+            display = info.get("display") or mai.display()
+            C.register_mai_theme(slug, display, str(p))
+            C.apply_mai_theme(mai)
+        except Exception as _e:
+            print(f"{C.WARN}Saved theme could not be loaded ({_e}); clearing from config.{C.RST}\n")
+            clear_custom_theme()
+
+    def _reapply_mai_theme() -> None:
+        """Re-apply saved .mai color overrides after a base theme switch."""
+        info = load_custom_theme_info()
+        if not info:
+            return
+        from pathlib import Path
+        from mahanai.mai_parser import parse_mai_file
+        p = Path(info.get("path", ""))
+        if not p.is_file():
+            clear_custom_theme()
+            return
+        try:
+            C.apply_mai_theme(parse_mai_file(p))
+        except Exception as _e:
+            print(f"{C.WARN}Saved theme could not be re-applied ({_e}); clearing from config.{C.RST}\n")
+            clear_custom_theme()
+
+    # ── Server mode ───────────────────────────────────────────────────────────
+    if args.server:
+        from mahanai.server import ServerConfig, run_server
+        C.apply_theme(load_theme())
+        _register_and_apply_saved_mai_theme()
+        run_server(ServerConfig(
+            server_type      = args.type,
+            port             = args.port,
+            gateway_key      = args.cli_api_key,   # clients must present this key (None = open)
+            api_key          = api_key,            # NVIDIA server backend key
+            anthropic_key    = args.cli_api_key,   # Anthropic backend key (pass via --api-key)
+            nvidia_api_key   = nvidia_api_key,
+            codex_token      = load_codex_token(),
+            custom_endpoint  = load_custom_endpoint(),
+        ))
+        return
+
+    # OpenAI client kept for future tool-call support; direct httpx used for actual requests.
+    client: OpenAI | None = (
+        OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key) if api_key else None
+    )
+
+    # ── .mahanairc loading ────────────────────────────────────────────────────
+    _rc_config = None
+    _rc_extras: list[str] = []
+    _rc_path = workspace / ".mahanairc"
+    if _rc_path.is_file():
+        try:
+            _rc_config = parse_rc_file(_rc_path)
+            _rc_extras = _rc_config.system_extras[:]
+        except Exception as _rc_err:
+            print(f"{C.WARN}.mahanairc parse error: {_rc_err}{C.RST}\n")
+
+    # ── New feature state ─────────────────────────────────────────────────────
+    _memories: dict[str, dict] = load_memories()
+    _mem_texts = [m["content"] for m in _memories.values()]
+    _personality, _personality_source = load_personality(workspace)
+    system_prompt = build_system_prompt(workspace, _mem_texts, rc_extras=_rc_extras, personality=_personality)
+
+    history: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+
+    active_model_idx = next(
+        (i for i, m in enumerate(AVAILABLE_MODELS) if m.get("claude_model") == "claude-haiku-4-5-20251001"),
+        0,
+    )
+    current_effort = "medium"
+    plan_mode = False
+    show_tokens: bool = load_tokens_setting()
+    show_timestamps: bool = False
+    highlight_enabled: bool = False
+    voice_enabled: bool = False
+    vim_mode: bool = False
+    shell_history_inject: bool = False
+    last_user_input: str | None = None
+    last_ai_reply: str | None = None
+    _session_id: str = _new_session_id()
+    _last_response_time: float = 0.0
+    _notify_threshold: float = 10.0  # seconds — notify when response takes longer than this
+    _active_project: str | None = load_active_project()
+    _current_chat_name: str | None = None  # set after first AI response
+
+    # Cost tracker
+    show_cost: bool = load_cost_setting()
+    _session_input_tokens: int = 0
+    _session_output_tokens: int = 0
+    _session_cost_usd: float = 0.0
+
+    # Context window manager
+    _context_limit: int = load_context_limit()
+
+    # Conversation branches (session-only, not persisted)
+    _branches: dict[str, list[dict]] = {}
+    _tasks: dict[str, dict] = _BACKGROUND_TASKS
+    _aliases: dict[str, str] = load_aliases()
+    _index_chunks: list[dict] = load_index_documents()
+    _macro_recording: str | None = None
+    _macro_steps: list[str] = []
+    _attached_file: Path | None = None
+    _pending_image: dict | None = None
+    _input_queue: list[str] = []
+    _plugin_mtimes: dict[str, float] = {}
+
+    C.apply_theme(load_theme())
+    _register_and_apply_saved_mai_theme()
+    _inject_ollama_providers()
+    _inject_saved_plugins()
+    for _pn, _pd in load_plugins().items():
+        _pp = Path(_pd.get("path", ""))
+        if _pp.is_file():
+            _plugin_mtimes[_pn] = _pp.stat().st_mtime
+    _env_model = os.environ.get("MAHANAI_MODEL", "")
+    _env_model_unrecognized = False
+    if _env_model:
+        _env_idx = next(
+            (i for i, m in enumerate(AVAILABLE_MODELS) if m["name"] == _env_model),
+            None,
+        )
+        if _env_idx is not None:
+            active_model_idx = _env_idx
+        else:
+            _env_model_unrecognized = True
+    _setup_tab_completion()
+    _update_thread = _start_update_check()
+    print_startup_banner(AVAILABLE_MODELS[active_model_idx]["label"], compact=compact)
+    print()
+    _print_update_notice(_update_thread)
+
+    if not is_onboarding_complete():
+        _run_onboarding_wizard()
+    if _env_model_unrecognized:
+        print(f"{C.WARN}MAHANAI_MODEL={_env_model!r} not found in model list; using default.{C.RST}\n")
+
+    if nvidia_api_key:
+        print(
+            f"{C.OK}NVIDIA direct mode active{C.RST} {C.DIM}(bypassing server, using NVIDIA API directly){C.RST}\n"
+            f"{C.DIM}  Use /api-key-nvidia clear to switch back to server mode.{C.RST}\n"
+        )
+
+    if (workspace / "MAHANAI.md").is_file():
+        print(f"{C.OK}🤖 MAHANAI.md{C.RST} {C.DIM}loaded as project context for all providers.{C.RST}\n")
+
+    if _active_project:
+        _ap_info = load_projects().get(_active_project)
+        if _ap_info:
+            print(
+                f"{C.OK}Project:{C.RST} {_ap_info['display']}  "
+                f"{C.DIM}({_active_project})  chats → {_ap_info['chats_dir']}{C.RST}\n"
+            )
+
+    if _rc_config is not None:
+        _rc_note_parts = []
+        if _rc_config.context_files:
+            _rc_note_parts.append(f"{len(_rc_config.context_files)} context file(s)")
+        if _rc_config.mmd_plugins:
+            _rc_note_parts.append(f"{len(_rc_config.mmd_plugins)} plugin(s)")
+        if _rc_config.system_extras:
+            _rc_note_parts.append(f"{len(_rc_config.system_extras)} package extra(s)")
+        _rc_note = ", ".join(_rc_note_parts) if _rc_note_parts else "loaded"
+        print(f"{C.OK}📋 .mahanairc{C.RST} {C.DIM}{_rc_note}{C.RST}\n")
+        for _rc_warn in _rc_config.warnings:
+            print(f"{C.WARN}  .mahanairc: {_rc_warn}{C.RST}")
+        # Auto-load .mmd plugins declared in .mahanairc
+        for _rc_mmd_path in _rc_config.mmd_plugins:
+            _rc_mmd_p = Path(_rc_mmd_path)
+            if _rc_mmd_p.is_file():
+                try:
+                    _rc_plugin = parse_mmd_file(_rc_mmd_p)
+                    _LOADED_PLUGINS[_rc_plugin.name] = _rc_plugin
+                    print(f"{C.DIM}  .mahanairc: loaded plugin '{_rc_plugin.name}'{C.RST}")
+                except Exception as _rc_pe:
+                    print(f"{C.WARN}  .mahanairc: could not load plugin {_rc_mmd_path!r}: {_rc_pe}{C.RST}")
+            else:
+                print(f"{C.WARN}  .mahanairc: plugin file not found: {_rc_mmd_path!r}{C.RST}")
+        # Inject context files into system prompt
+        for _rc_ctx_path in _rc_config.context_files:
+            _rc_ctx_p = Path(_rc_ctx_path)
+            if _rc_ctx_p.is_file():
+                try:
+                    _rc_ctx_text = _rc_ctx_p.read_text(encoding="utf-8", errors="replace").strip()
+                    if _rc_ctx_text:
+                        history[0]["content"] += (
+                            f"\n\n--- Context ({_rc_ctx_p.name}) ---\n{_rc_ctx_text}\n---"
+                        )
+                        print(f"{C.DIM}  .mahanairc: injected context '{_rc_ctx_p.name}'{C.RST}")
+                except Exception as _rc_ce:
+                    print(f"{C.WARN}  .mahanairc: could not read context {_rc_ctx_path!r}: {_rc_ce}{C.RST}")
+            else:
+                print(f"{C.WARN}  .mahanairc: context file not found: {_rc_ctx_path!r}{C.RST}")
+
+    if _personality:
+        print(f"{C.OK}🎭 Personality loaded{C.RST} {C.DIM}({_personality_source}){C.RST}\n")
+
+    model = os.environ.get("MAHANAI_MODEL", DEFAULT_MODEL)
+
+    while True:
+        if _input_queue:
+            user = _input_queue.pop(0)
+            ts_prefix = f"{C.DIM}[{datetime.datetime.now().strftime('%H:%M:%S')}] {C.RST}" if show_timestamps else ""
+            print(f"{ts_prefix}{C.USER}{C.USER_NAME}{C.RST}: {user}", flush=True)
+        else:
+            try:
+                ts_prefix = f"{C.DIM}[{datetime.datetime.now().strftime('%H:%M:%S')}] {C.RST}" if show_timestamps else ""
+                print(f"{ts_prefix}{C.USER}{C.USER_NAME}{C.RST}: ", end="", flush=True)
+                if voice_enabled:
+                    raw_input = _voice_get_input()
+                    if raw_input:
+                        print(raw_input, flush=True)
+                        user = raw_input
+                    else:
+                        user = input().strip()
+                else:
+                    user = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+        if not user:
+            continue
+        if user.lower() in {"exit", "quit"}:
+            break
+
+        # Alias expansion
+        if user.startswith("/"):
+            _cmd_check, _ = _slash_command(user)
+            if _cmd_check in _aliases:
+                user = _aliases[_cmd_check]
+
+        # Macro recording — capture slash commands (skip meta-commands)
+        if _macro_recording and user.startswith("/"):
+            _cmd_raw, _ = _slash_command(user)
+            if _cmd_raw not in {"/macro", "/exit", "/quit"}:
+                _macro_steps.append(user)
+
+        if user.startswith("/"):
+            cmd, rest = _slash_command(user)
+            if cmd in {"/exit", "/quit"}:
+                break
+            if cmd == "/help":
+                _print_help(rest.strip())
+                continue
+            if cmd == "/models":
+                active_model_idx = _model_selector(active_model_idx)
+                chosen = AVAILABLE_MODELS[active_model_idx]
+                print_startup_banner(chosen["label"], compact=compact)
+                print()
+                print(f"{C.OK}Model set to:{C.RST} {chosen['label']}  {C.DIM}({chosen['name']}){C.RST}\n")
+                continue
+            if cmd == "/mode":
+                target = rest.strip().lower()
+                if target == "claude":
+                    active_model_idx = next(
+                        i for i, m in enumerate(AVAILABLE_MODELS) if m.get("claude_model") == "claude-sonnet-4-6"
+                    )
+                    print(f"{C.OK}Switched to:{C.RST} {AVAILABLE_MODELS[active_model_idx]['label']}\n")
+
+                elif target in {"default", "server", "mahanai", ""}:
+                    active_model_idx = 1
+                    print(f"{C.OK}Switched to:{C.RST} {AVAILABLE_MODELS[1]['label']}\n")
+                else:
+                    print(f"{C.ERR}Unknown mode '{target}'.{C.RST} Use: /mode claude  or  /mode default\n")
+                continue
+            if cmd == "/api-key":
+                sub = rest.strip().lower()
+                if sub == "clear":
+                    clear_saved_api_key()
+                    print(f"{C.OK}Saved API key removed from disk.{C.RST}")
+                    api_key = resolve_api_key()
+                    client = (
+                        OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+                        if api_key
+                        else None
+                    )
+                    continue
+                new_key = rest.strip() if rest.strip() else getpass.getpass("API key: ").strip()
+                if not new_key:
+                    print(f"{C.ERR}Empty key; nothing saved.{C.RST}")
+                    continue
+                save_api_key(new_key)
+                os.environ["MAHANAI_API_KEY"] = new_key
+                api_key = new_key
+                client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=new_key)
+                print(
+                    f"{C.OK}API key saved to{C.RST} {C.DIM}{config_file_path()}{C.RST}\n"
+                )
+                continue
+            if cmd == "/api-key-nvidia":
+                sub = rest.strip().lower()
+                if sub == "clear":
+                    clear_nvidia_api_key()
+                    nvidia_api_key = None
+                    print(f"{C.OK}NVIDIA API key removed. Switched back to server mode.{C.RST}\n")
+                    continue
+                new_key = rest.strip() if rest.strip() else getpass.getpass("NVIDIA API key: ").strip()
+                if not new_key:
+                    print(f"{C.ERR}Empty key; nothing saved.{C.RST}")
+                    continue
+                save_nvidia_api_key(new_key)
+                nvidia_api_key = new_key
+                print(
+                    f"{C.OK}NVIDIA API key saved.{C.RST} {C.DIM}Now calling NVIDIA directly (server bypassed).{C.RST}\n"
+                )
+                continue
+            if cmd == "/codex-login":
+                _codex_pkce_login()
+                continue
+            if cmd == "/codex-logout":
+                clear_codex_token()
+                print(f"{C.OK}OpenAI Codex credentials removed.{C.RST}\n")
+                continue
+            if cmd == "/effort":
+                level = rest.strip().lower().replace(" ", "-")
+                if not level:
+                    print(f"{C.DIM}Current effort: {current_effort}{C.RST}\n")
+                    continue
+                valid_efforts = ["low", "medium", "high", "very-high"]
+                if level not in valid_efforts:
+                    print(
+                        f"{C.ERR}Invalid effort level.{C.RST} "
+                        f"Choose: low, medium, high, very-high\n"
+                    )
+                    continue
+                chosen = AVAILABLE_MODELS[active_model_idx]
+                if chosen.get("claude_model") == "claude-haiku-4-5-20251001":
+                    print(
+                        f"{C.ERR}Effort is disabled for Claude Haiku 4.5.{C.RST} "
+                        f"Switch to Opus or Sonnet first.\n"
+                    )
+                    continue
+                if level == "very-high":
+                    print(
+                        f"{C.ERR}⚠ Warning:{C.RST} Very High effort uses the maximum thinking budget "
+                        f"— expect significantly higher token consumption and slower responses.\n"
+                    )
+                current_effort = level
+                print(f"{C.OK}Effort set to: {level}{C.RST}\n")
+                continue
+            if cmd == "/plan":
+                target = rest.strip().lower()
+                if target == "on":
+                    plan_mode = True
+                    print(f"{C.OK}Plan mode ON{C.RST} — MahanAI will outline a plan before every response.\n")
+                elif target == "off":
+                    plan_mode = False
+                    print(f"{C.OK}Plan mode OFF{C.RST}\n")
+                else:
+                    print(f"{C.ERR}Usage:{C.RST} /plan on  or  /plan off\n")
+                continue
+            if cmd == "/approvals":
+                sub = rest.strip().lower()
+                if sub == "clear":
+                    _aa = load_always_allowed()
+                    if not _aa.get("command_prefixes") and not _aa.get("file_ops"):
+                        print(f"{C.DIM}No Always Allow rules to clear.{C.RST}\n")
+                    else:
+                        from mahanai.config import _read_config, _write_config
+                        data = _read_config()
+                        data.pop("always_allowed", None)
+                        _write_config(data)
+                        print(f"{C.OK}All Always Allow rules cleared.{C.RST}\n")
+                else:
+                    aa = load_always_allowed()
+                    prefixes = aa.get("command_prefixes", [])
+                    file_ops = aa.get("file_ops", [])
+                    if not prefixes and not file_ops:
+                        print(f"{C.DIM}No Always Allow rules stored yet.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Always Allow rules:{C.RST}")
+                        if prefixes:
+                            print(f"  Commands:   {', '.join(prefixes)}")
+                        if file_ops:
+                            print(f"  File ops:   {', '.join(file_ops)}")
+                        print()
+                continue
+            if cmd == "/themes":
+                sub = rest.strip().lower().replace(" ", "-")
+                # Normalise long display names to slugs
+                _alias = {
+                    "midnight-colorblind-friendly": "midnight-cb",
+                    "light-colorblind-friendly":    "light-cb",
+                    "midnight-colorblind":          "midnight-cb",
+                    "light-colorblind":             "light-cb",
+                }
+                sub = _alias.get(sub, sub)
+                if not sub:
+                    print(f"{C.DIM}Available themes:{C.RST}")
+                    for slug, display in C.THEME_DISPLAY.items():
+                        mai_tag = f"  {C.DIM}[.mai]{C.RST}" if slug in C.MAI_THEMES else ""
+                        print(f"  {C.OK}{slug:<22}{C.RST}  {display}{mai_tag}")
+                    print()
+                elif sub not in C.THEME_NAMES:
+                    print(
+                        f"{C.ERR}Unknown theme '{sub}'.{C.RST} "
+                        f"Available: {', '.join(C.THEME_NAMES)}\n"
+                    )
+                elif sub in C.MAI_THEMES:
+                    # Re-select a registered .mai theme
+                    from pathlib import Path as _Path
+                    from mahanai.mai_parser import parse_mai_file as _parse_mai
+                    _mp = _Path(C.MAI_THEMES[sub])
+                    if not _mp.is_file():
+                        print(f"{C.ERR}Theme file missing: {C.MAI_THEMES[sub]}{C.RST}\n")
+                    else:
+                        try:
+                            _mai = _parse_mai(_mp)
+                            C.apply_theme("midnight")
+                            C.apply_mai_theme(_mai)
+                            save_theme(sub)
+                            print_startup_banner(AVAILABLE_MODELS[active_model_idx]["label"], compact=compact)
+                            print()
+                            print(f"{C.OK}Theme set to:{C.RST} {C.THEME_DISPLAY[sub]}\n")
+                        except Exception as _e:
+                            print(f"{C.ERR}Failed to apply theme: {_e}{C.RST}\n")
+                else:
+                    C.apply_theme(sub)
+                    _reapply_mai_theme()
+                    save_theme(sub)
+                    print_startup_banner(AVAILABLE_MODELS[active_model_idx]["label"], compact=compact)
+                    print()
+                    print(f"{C.OK}Theme set to:{C.RST} {C.THEME_DISPLAY[sub]}\n")
+                continue
+            if cmd == "/theme-load":
+                _path = rest.strip()
+                if not _path:
+                    print(f"{C.ERR}Usage: /theme-load <path-to-file.mai>{C.RST}\n")
+                    continue
+                from pathlib import Path as _Path
+                from mahanai.mai_parser import parse_mai_file as _parse_mai
+                _p = _Path(_path).expanduser().resolve()
+                if not _p.is_file():
+                    print(f"{C.ERR}File not found: {_path}{C.RST}\n")
+                    continue
+                try:
+                    _mai = _parse_mai(_p)
+                    _slug = _mai.slug()
+                    _display = _mai.display()
+                    C.apply_theme("midnight")
+                    C.apply_mai_theme(_mai)
+                    C.register_mai_theme(_slug, _display, str(_p))
+                    save_custom_theme_info(_slug, _display, str(_p))
+                    save_theme(_slug)
+                    print_startup_banner(AVAILABLE_MODELS[active_model_idx]["label"], compact=compact)
+                    print()
+                    print(f"{C.OK}Theme loaded:{C.RST} {_display}  {C.DIM}(use /themes to switch){C.RST}\n")
+                except Exception as _e:
+                    print(f"{C.ERR}Failed to load theme: {_e}{C.RST}\n")
+                continue
+            if cmd == "/theme-unload":
+                C.unregister_all_mai_themes()
+                clear_custom_theme()
+                C.apply_theme("midnight")
+                C.reset_names()
+                save_theme("midnight")
+                print_startup_banner(AVAILABLE_MODELS[active_model_idx]["label"], compact=compact)
+                print()
+                print(f"{C.OK}Custom theme unloaded.{C.RST}\n")
+                continue
+            if cmd == "/add-ollama":
+                parts = rest.split(None, 3)
+                if len(parts) < 3:
+                    print(
+                        f"{C.ERR}Usage:{C.RST} /add-ollama <name> <address> <port> [api_key]\n"
+                        f"{C.DIM}  e.g. /add-ollama llama3 localhost 11434{C.RST}\n"
+                    )
+                    continue
+                o_name, o_addr = parts[0], parts[1]
+                try:
+                    o_port = int(parts[2])
+                except ValueError:
+                    print(f"{C.ERR}Port must be a number.{C.RST}\n")
+                    continue
+                o_key = parts[3] if len(parts) > 3 else _OLLAMA_DEFAULT_API_KEY
+                o_url = _build_ollama_url(o_addr, o_port)
+                o_clean = _strip_protocol(o_addr)
+                # Remove existing entry with same name so we can update it
+                for _i, _m in enumerate(AVAILABLE_MODELS):
+                    if _m.get("mode") == "ollama" and _m["name"] == o_name:
+                        AVAILABLE_MODELS.pop(_i)
+                        break
+                AVAILABLE_MODELS.append(_ollama_entry(o_name, o_clean, o_port, o_key, o_url))
+                save_ollama_provider(o_name, o_clean, o_port, o_key, o_url)
+                print(
+                    f"{C.OK}Ollama provider added:{C.RST} {o_name}  "
+                    f"{C.DIM}{o_url}{C.RST}\n"
+                    f"{C.DIM}  Use /models to switch to it.{C.RST}\n"
+                )
+                continue
+            if cmd == "/remove-ollama":
+                o_name = rest.strip()
+                if not o_name:
+                    print(f"{C.ERR}Usage:{C.RST} /remove-ollama <name>\n")
+                    continue
+                removed = False
+                for _i, _m in enumerate(AVAILABLE_MODELS):
+                    if _m.get("mode") == "ollama" and _m["name"] == o_name:
+                        AVAILABLE_MODELS.pop(_i)
+                        removed = True
+                        break
+                remove_ollama_provider(o_name)
+                if removed:
+                    print(f"{C.OK}Ollama provider '{o_name}' removed.{C.RST}\n")
+                else:
+                    print(f"{C.ERR}No Ollama provider named '{o_name}' found.{C.RST}\n")
+                continue
+            if cmd == "/change-ollama":
+                parts = rest.split(None, 3)
+                if len(parts) < 3:
+                    print(
+                        f"{C.ERR}Usage:{C.RST} /change-ollama <name> <address> <port> [api_key]\n"
+                        f"{C.DIM}  e.g. /change-ollama llama3 192.168.1.5 11434{C.RST}\n"
+                    )
+                    continue
+                o_name, o_addr = parts[0], parts[1]
+                try:
+                    o_port = int(parts[2])
+                except ValueError:
+                    print(f"{C.ERR}Port must be a number.{C.RST}\n")
+                    continue
+                o_key_arg = parts[3] if len(parts) > 3 else None
+                # Find existing entry
+                existing_idx = None
+                existing_entry = None
+                for _i, _m in enumerate(AVAILABLE_MODELS):
+                    if _m.get("mode") == "ollama" and _m["name"] == o_name:
+                        existing_idx = _i
+                        existing_entry = _m
+                        break
+                if existing_entry is None:
+                    print(
+                        f"{C.ERR}No Ollama provider named '{o_name}' found.{C.RST} "
+                        f"Use /add-ollama to create it.\n"
+                    )
+                    continue
+                o_key = o_key_arg if o_key_arg is not None else (existing_entry.get("ollama_api_key") or _OLLAMA_DEFAULT_API_KEY)
+                o_url = _build_ollama_url(o_addr, o_port)
+                o_clean = _strip_protocol(o_addr)
+                AVAILABLE_MODELS[existing_idx] = _ollama_entry(o_name, o_clean, o_port, o_key, o_url)
+                save_ollama_provider(o_name, o_clean, o_port, o_key, o_url)
+                print(
+                    f"{C.OK}Ollama provider updated:{C.RST} {o_name}  "
+                    f"{C.DIM}{o_url}{C.RST}\n"
+                )
+                continue
+            if cmd == "/custom":
+                sub = rest.strip()
+                if sub.lower() == "clear":
+                    if not load_custom_endpoint():
+                        print(f"{C.WARN}No custom endpoint configured.{C.RST}\n")
+                    else:
+                        clear_custom_endpoint()
+                        print(f"{C.OK}Custom endpoint removed.{C.RST}\n")
+                    continue
+                # Parse inline args: url [model [api_key]]
+                parts = sub.split(None, 2)
+                if parts:
+                    c_url = parts[0]
+                    c_model = parts[1] if len(parts) > 1 else ""
+                    c_key = parts[2] if len(parts) > 2 else ""
+                else:
+                    existing = load_custom_endpoint()
+                    print(f"\n{C.DIM}  Configure a custom OpenAI-compatible endpoint.{C.RST}")
+                    if existing:
+                        print(f"{C.DIM}  Current: {existing['url']}  model={existing['model']}{C.RST}")
+                    c_url = input("  Base URL (e.g. http://localhost:11434/v1): ").strip()
+                    if not c_url:
+                        print(f"{C.ERR}No URL entered; cancelled.{C.RST}\n")
+                        continue
+                    c_model = input("  Model name [gpt-3.5-turbo]: ").strip()
+                    c_key = input("  API key (leave blank if none): ").strip()
+                if not c_model:
+                    c_model = "gpt-3.5-turbo"
+                save_custom_endpoint(c_url, c_model, c_key)
+                print(
+                    f"{C.OK}Custom endpoint saved.{C.RST} "
+                    f"{C.DIM}URL={c_url}  model={c_model}{C.RST}\n"
+                    f"{C.DIM}  Use /models to switch to 'Custom Endpoint'.{C.RST}\n"
+                )
+                continue
+            if cmd == "/fileslist":
+                _show_fileslist(workspace)
+                continue
+            if cmd == "/init":
+                mahanai_md_path = workspace / "MAHANAI.md"
+                if mahanai_md_path.is_file():
+                    print(
+                        f"{C.WARN}MAHANAI.md already exists.{C.RST} "
+                        f"{C.DIM}Delete it first to regenerate, or edit it directly.{C.RST}\n"
+                    )
+                    continue
+                print(f"{C.DIM}Scanning workspace...{C.RST}")
+                md_content = _generate_mahanai_md(workspace)
+                mahanai_md_path.write_text(md_content, encoding="utf-8")
+                print(
+                    f"{C.OK}🤖 MAHANAI.md created.{C.RST}\n"
+                    f"{C.DIM}  Edit it to fill in project details — it's loaded automatically\n"
+                    f"  as context for all non-Claude providers.{C.RST}\n"
+                )
+                continue
+            if cmd == "/store":
+                from . import store as _store
+                _sub, _, _srest = rest.strip().partition(" ")
+                _sub = _sub.lower()
+                _srest = _srest.strip()
+
+                if _sub == "login":
+                    _tok = _srest.strip()
+                    if not _tok:
+                        print(f"{C.ERR}Usage: /store login <github-personal-access-token>{C.RST}\n")
+                    else:
+                        try:
+                            _gh_user = _store.whoami(_tok)
+                            _store.save_store_token(_tok)
+                            print(f"{C.OK}Logged in to GitHub as:{C.RST} {_gh_user}\n")
+                        except Exception as _se:
+                            print(f"{C.ERR}Login failed: {_se}{C.RST}\n")
+
+                elif _sub == "logout":
+                    _store.remove_store_token()
+                    print(f"{C.OK}GitHub account unlinked from store.{C.RST}\n")
+
+                elif _sub in ("browse", "search", ""):
+                    _query = _srest if _sub in ("search", "browse") else ""
+                    _stok = _store.get_store_token()
+                    try:
+                        _items = _store.search_plugins(_query, token=_stok)
+                        if not _items:
+                            print(f"{C.DIM}No plugins found{' for: ' + _query if _query else ''}.{C.RST}\n")
+                        else:
+                            _label = f"Results for '{_query}'" if _query else "Available plugins"
+                            print(f"{C.DIM}{_label}:{C.RST}")
+                            for _it in _items:
+                                _desc = _it.get('description') or ''
+                                print(
+                                    f"  {C.OK}🔌 {_it['full_name']}{C.RST}"
+                                    + (f"  {C.DIM}{_desc}{C.RST}" if _desc else "")
+                                )
+                            print(f"\n{C.DIM}Install with: /store install <user/codename>{C.RST}\n")
+                    except Exception as _se:
+                        print(f"{C.ERR}Store error: {_se}{C.RST}\n")
+
+                elif _sub == "install":
+                    _target = _srest.strip()
+                    if not _target:
+                        print(f"{C.ERR}Usage: /store install <user/codename>  or  /store install <codename>{C.RST}\n")
+                    else:
+                        _stok = _store.get_store_token()
+                        try:
+                            _repo = _target if "/" in _target else _store.find_plugin_repo(_target, token=_stok)
+                            if not _repo:
+                                print(f"{C.ERR}Plugin '{_target}' not found in store.{C.RST}\n")
+                            else:
+                                print(f"{C.DIM}Downloading and scanning {_repo}...{C.RST}")
+                                from .store_security import install_plugin_with_security
+                                _success, _msg, _mmd_path = install_plugin_with_security(_repo, token=_stok)
+                                
+                                if _success and _mmd_path:
+                                    _plugin = parse_mmd_file(_mmd_path)
+                                    _LOADED_PLUGINS[_plugin.name] = _plugin
+                                    save_plugin(_plugin.name, str(_mmd_path), _plugin.codename, _plugin.reg_store, _plugin.reg_name)
+                                    get_audit_logger().plugin_loaded(_plugin.name, _plugin.version, "store")
+                                    _triggers = ", ".join(_plugin.command_triggers()) or "(none)"
+                                    print(
+                                        f"{C.OK}🔌 Installed:{C.RST} {_plugin.name}  "
+                                        f"{C.DIM}v{_plugin.version}  commands: {_triggers}{C.RST}\n"
+                                    )
+                                else:
+                                    print(f"{C.ERR}{_msg}{C.RST}\n")
+                        except Exception as _se:
+                            print(f"{C.ERR}Install failed: {_se}{C.RST}\n")
+
+                elif _sub == "upload":
+                    _up_path = _srest.strip()
+                    if not _up_path:
+                        print(f"{C.ERR}Usage: /store upload <path-to-file.mmd>{C.RST}\n")
+                    else:
+                        _stok = _store.get_store_token()
+                        if not _stok:
+                            print(f"{C.ERR}Not logged in. Run: /store login <github-token>{C.RST}\n")
+                        else:
+                            from pathlib import Path as _Path
+                            _up_pp = _Path(_up_path).expanduser().resolve()
+                            if not _up_pp.is_file():
+                                print(f"{C.ERR}File not found: {_up_path}{C.RST}\n")
+                            elif _up_pp.suffix.lower() != ".mmd":
+                                print(f"{C.ERR}Not a .mmd file: {_up_path}{C.RST}\n")
+                            else:
+                                try:
+                                    _repo_url = _store.upload_plugin(_stok, _up_pp)
+                                    print(f"{C.OK}Plugin published:{C.RST} {_repo_url}\n")
+                                except Exception as _se:
+                                    print(f"{C.ERR}Upload failed: {_se}{C.RST}\n")
+
+                elif _sub in ("update", "update-all"):
+                    _stok = _store.get_store_token()
+                    _installed = load_plugins()
+                    if not _installed:
+                        print(f"{C.DIM}No installed plugins to update.{C.RST}\n")
+                    else:
+                        _update_targets = {}
+                        if _sub == "update" and _srest.strip():
+                            _codename_filter = _srest.strip()
+                            _update_targets = {k: v for k, v in _installed.items() if v.get("codename") == _codename_filter or k == _codename_filter}
+                            if not _update_targets:
+                                print(f"{C.ERR}Plugin '{_codename_filter}' not found.{C.RST}\n")
+                        else:
+                            _update_targets = _installed
+                        for _pname, _pdata in _update_targets.items():
+                            _pcodename = _pdata.get("codename", "")
+                            if not _pcodename:
+                                continue
+                            print(f"{C.DIM}Checking {_pname}...{C.RST}")
+                            try:
+                                _repo = _store.find_plugin_repo(_pcodename, token=_stok)
+                                if not _repo:
+                                    print(f"  {C.ERR}Not found in store.{C.RST}")
+                                    continue
+                                _updated, _msg = _store.update_plugin(_repo, token=_stok)
+                                if _updated:
+                                    _new_plugin = parse_mmd_file(Path(_msg))
+                                    _LOADED_PLUGINS[_new_plugin.name] = _new_plugin
+                                    save_plugin(_new_plugin.name, _msg, _new_plugin.codename, _new_plugin.reg_store, _new_plugin.reg_name)
+                                    print(f"  {C.OK}Updated {_pname} → v{_new_plugin.version}{C.RST}")
+                                else:
+                                    print(f"  {C.DIM}{_pname}: {_msg}{C.RST}")
+                            except Exception as _se:
+                                print(f"  {C.ERR}Update failed: {_se}{C.RST}")
+                        print()
+
+                else:
+                    print(
+                        f"{C.DIM}Store commands:{C.RST}\n"
+                        f"  /store login <token>        Link your GitHub account\n"
+                        f"  /store logout               Unlink GitHub account\n"
+                        f"  /store browse               Browse all available plugins\n"
+                        f"  /store search <query>       Search plugins by name/keyword\n"
+                        f"  /store install <user/id>    Download and install a plugin\n"
+                        f"  /store upload <path>        Publish your .mmd to the store\n"
+                        f"  /store update [codename]    Update one or all installed plugins\n"
+                        f"  /store update-all           Update all installed plugins\n"
+                    )
+                continue
+
+            if cmd == "/plugin-load":
+                _ppath = rest.strip()
+                if not _ppath:
+                    print(f"{C.ERR}Usage: /plugin-load <path-to-file.mmd>{C.RST}\n")
+                    continue
+                from pathlib import Path as _Path
+                _pp = _Path(_ppath).expanduser().resolve()
+                if not _pp.is_file():
+                    print(f"{C.ERR}File not found: {_ppath}{C.RST}\n")
+                    continue
+                if _pp.suffix.lower() != ".mmd":
+                    print(f"{C.ERR}Not a .mmd file: {_ppath}{C.RST}\n")
+                    continue
+                try:
+                    _plugin = parse_mmd_file(_pp)
+                    _audit = get_audit_logger()
+                    
+                    # ===== SIGNATURE VERIFICATION =====
+                    _is_signed, _sig_msg, _sig_metadata = _plugin_verifier.verify_plugin_signature(_pp, require_signature=False)
+                    if _sig_metadata:
+                        print(f"{C.OK}✅ Signature verified:{C.RST} {_sig_msg}")
+                        print(f"{C.DIM}  Signed at: {_sig_metadata.get('signed_at', 'unknown')}{C.RST}")
+                        _audit.signature_verified(_plugin.name, _sig_metadata.get('signed_at', 'unknown'))
+                    else:
+                        print(f"{C.WARN}⚠️  {_sig_msg}{C.RST}")
+                    # ===== END SIGNATURE VERIFICATION =====
+                    
+                    # ===== SECURITY SCAN =====
+                    _sec_report = scan_plugin_security(_plugin)
+                    print(format_security_report(_sec_report, verbose=True))
+                    
+                    # Block if there are BLOCKED issues
+                    if _sec_report.blocked_count() > 0:
+                        print(f"{C.ERR}❌ Cannot load plugin: Security issues detected!{C.RST}\n")
+                        _audit.security_blocked(
+                            _plugin.name,
+                            "Failed security scan",
+                            _sec_report.blocked_count(),
+                            {"version": _plugin.version}
+                        )
+                        continue
+                    
+                    # Warn if there are warnings but allow loading with user confirmation
+                    if _sec_report.warning_count() > 0:
+                        _audit.security_warning(
+                            _plugin.name,
+                            "Security warnings detected",
+                            _sec_report.warning_count(),
+                            {"version": _plugin.version, "registry": _plugin.reg_store}
+                        )
+                        _response = input(f"{C.WARN}⚠️  Load anyway? (yes/no): {C.RST}")
+                        if _response.lower() not in ("yes", "y"):
+                            print(f"{C.DIM}Plugin load cancelled.{C.RST}\n")
+                            continue
+                    # ===== END SECURITY SCAN =====
+                    
+                    _LOADED_PLUGINS[_plugin.name] = _plugin
+                    save_plugin(_plugin.name, str(_pp), _plugin.codename, _plugin.reg_store, _plugin.reg_name)
+                    _audit.plugin_loaded(_plugin.name, _plugin.version, "local")
+                    
+                    _triggers = ", ".join(_plugin.command_triggers()) or "(none)"
+                    print(
+                        f"{C.OK}🔌 Plugin loaded:{C.RST} {_plugin.name}  "
+                        f"{C.DIM}v{_plugin.version}{C.RST}\n"
+                        f"{C.DIM}  Commands: {_triggers}{C.RST}\n"
+                    )
+                except Exception as _e:
+                    print(f"{C.ERR}Failed to load plugin: {_e}{C.RST}\n")
+                continue
+            if cmd == "/plugin-list":
+                if not _LOADED_PLUGINS:
+                    print(f"{C.DIM}No plugins loaded.{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Loaded plugins:{C.RST}")
+                    for _pl in _LOADED_PLUGINS.values():
+                        _triggers = ", ".join(_pl.command_triggers()) or "(none)"
+                        _codename_str = f"  [{_pl.codename}]" if _pl.codename else ""
+                        _reg_str = f"  {_pl.reg_name}" if _pl.reg_name else ""
+                        print(f"  {C.OK}🔌 {_pl.name}{C.RST}{_codename_str}  {C.DIM}v{_pl.version}{_reg_str}  commands: {_triggers}{C.RST}")
+                    print()
+                continue
+            if cmd == "/plugin-unload":
+                _pname = rest.strip()
+                if not _pname:
+                    print(f"{C.ERR}Usage: /plugin-unload <name>{C.RST}\n")
+                    continue
+                if _pname in _LOADED_PLUGINS:
+                    del _LOADED_PLUGINS[_pname]
+                    remove_plugin(_pname)
+                    get_audit_logger().plugin_unloaded(_pname)
+                    print(f"{C.OK}Plugin '{_pname}' unloaded.{C.RST}\n")
+                else:
+                    print(f"{C.ERR}No plugin named '{_pname}' found.{C.RST}\n")
+                continue
+            if cmd == "/plugin-audit":
+                _limit = 20
+                _arg = rest.strip()
+                if _arg and _arg.isdigit():
+                    _limit = int(_arg)
+                _audit_summary = get_audit_logger().format_log_summary(_limit)
+                print(_audit_summary)
+                continue
+            # Plugin hot-reload: check mtimes before dispatching plugin commands
+            for _pn_hot, _pd_hot in list(load_plugins().items()):
+                _pp_hot = Path(_pd_hot.get("path", ""))
+                if _pp_hot.is_file():
+                    _cur_mtime = _pp_hot.stat().st_mtime
+                    if _plugin_mtimes.get(_pn_hot, 0) != _cur_mtime:
+                        try:
+                            _new_pl = parse_mmd_file(_pp_hot)
+                            _LOADED_PLUGINS[_new_pl.name] = _new_pl
+                            _plugin_mtimes[_pn_hot] = _cur_mtime
+                            print(f"{C.DIM}🔌 Plugin '{_new_pl.name}' hot-reloaded.{C.RST}")
+                        except Exception:
+                            pass
+
+            # Check if the command matches a loaded plugin command
+            _plugin_handled = False
+            for _pl in _LOADED_PLUGINS.values():
+                for _pcmd in _pl.commands:
+                    if cmd == _pcmd.trigger:
+                        _plugin_handled = True
+                        for _action in _pcmd.actions:
+                            if _action.type == "claude-cmd":
+                                print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+                                _run_claude_cli(_action.value)
+                                print("\n")
+                            elif _action.type == "mahanai-cmd":
+                                # Reprocess as an internal slash command
+                                user = _action.value
+                            elif _action.type == "shell-cmd":
+                                import subprocess as _sp
+                                try:
+                                    _res = _sp.run(
+                                        _action.value, shell=True, capture_output=True, text=True, timeout=30
+                                    )
+                                    out = (_res.stdout + _res.stderr).strip()
+                                    if out:
+                                        print(out)
+                                except Exception as _se:
+                                    print(f"{C.ERR}Plugin shell error: {_se}{C.RST}")
+                        break
+                if _plugin_handled:
+                    break
+            if _plugin_handled:
+                continue
+
+            # ── Command palette ───────────────────────────────────────────────
+            if cmd in ("/cmd", "/palette"):
+                _q = rest.strip().lower()
+                _hits = [
+                    (c, d) for c, d in _ALL_COMMANDS
+                    if not _q or _q in c.lower() or _q in d.lower()
+                ]
+                if not _hits:
+                    print(f"{C.DIM}No commands matching '{rest.strip()}'.{C.RST}\n")
+                else:
+                    header = f"Commands matching '{rest.strip()}'" if _q else "All commands"
+                    print(f"{C.DIM}{header}:{C.RST}")
+                    for _c, _d in _hits:
+                        print(f"  {C.OK}{_c:<28}{C.RST}  {C.DIM}{_d}{C.RST}")
+                    print()
+                continue
+
+            # ── Conversation branching ────────────────────────────────────────
+            if cmd == "/branch":
+                _bparts = rest.split(None, 1)
+                _baction = _bparts[0].lower() if _bparts else ""
+                _barg = _bparts[1].strip() if len(_bparts) > 1 else ""
+                if _baction == "save":
+                    if not _barg:
+                        print(f"{C.ERR}Usage: /branch save <name>{C.RST}\n")
+                    else:
+                        _branches[_barg] = [m.copy() for m in history]
+                        print(f"{C.OK}Branch '{_barg}' saved{C.RST} {C.DIM}({len(history)} messages, session-only){C.RST}\n")
+                elif _baction == "load":
+                    if not _barg:
+                        print(f"{C.ERR}Usage: /branch load <name>{C.RST}\n")
+                    elif _barg not in _branches:
+                        print(f"{C.ERR}Branch '{_barg}' not found. Use /branch list.{C.RST}\n")
+                    else:
+                        history.clear()
+                        history.extend([m.copy() for m in _branches[_barg]])
+                        print(f"{C.OK}Branch '{_barg}' loaded{C.RST} {C.DIM}({len(history)} messages){C.RST}\n")
+                elif _baction == "list":
+                    if not _branches:
+                        print(f"{C.DIM}No branches saved yet (branches are session-only).{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Branches:{C.RST}")
+                        for _bn, _bh in _branches.items():
+                            _bmsg = len([m for m in _bh if m["role"] != "system"])
+                            print(f"  {C.OK}{_bn}{C.RST}  {C.DIM}({_bmsg} messages){C.RST}")
+                        print()
+                elif _baction == "clear":
+                    _branches.clear()
+                    print(f"{C.OK}All branches cleared.{C.RST}\n")
+                else:
+                    print(
+                        f"{C.DIM}Branch commands:{C.RST}\n"
+                        f"  /branch save <name>   Save current conversation as a branch\n"
+                        f"  /branch load <name>   Switch to a saved branch\n"
+                        f"  /branch list          List saved branches (session-only)\n"
+                        f"  /branch clear         Clear all branches\n"
+                    )
+                continue
+
+            # ── Cost tracker ──────────────────────────────────────────────────
+            if cmd == "/cost":
+                _sel_cost = AVAILABLE_MODELS[active_model_idx]
+                _mk = _sel_cost.get("claude_model") or _sel_cost.get("name", "")
+                _pr = _MODEL_PRICING.get(_mk)
+                print(f"{C.DIM}Session cost estimate:{C.RST}")
+                print(f"  Input tokens:   ~{_session_input_tokens:,}")
+                print(f"  Output tokens:  ~{_session_output_tokens:,}")
+                if _pr:
+                    print(f"  Estimated cost: ~${_session_cost_usd:.4f} USD")
+                    print(f"  {C.DIM}({_mk}: ${_pr[0]}/1M in, ${_pr[1]}/1M out){C.RST}")
+                else:
+                    print(f"  {C.DIM}(no pricing data for {_mk}){C.RST}")
+                print(f"  Cost display: {'on' if show_cost else 'off'}  (toggle with /cost-on|off)\n")
+                continue
+            if cmd == "/cost-on":
+                show_cost = True
+                save_cost_setting(True)
+                print(f"{C.OK}Cost display ON{C.RST} {C.DIM}(shown after each response){C.RST}\n")
+                continue
+            if cmd == "/cost-off":
+                show_cost = False
+                save_cost_setting(False)
+                print(f"{C.OK}Cost display OFF{C.RST}\n")
+                continue
+
+            # ── Context window limit ──────────────────────────────────────────
+            if cmd == "/context-limit":
+                _clarg = rest.strip()
+                if not _clarg:
+                    print(
+                        f"{C.DIM}Context limit: {_context_limit:,} tokens{C.RST} "
+                        f"{C.DIM}(set with /context-limit <tokens>, 0 to disable){C.RST}\n"
+                    )
+                else:
+                    try:
+                        _context_limit = int(_clarg.replace(",", ""))
+                        save_context_limit(_context_limit)
+                        if _context_limit == 0:
+                            print(f"{C.OK}Context trimming disabled.{C.RST}\n")
+                        else:
+                            print(f"{C.OK}Context limit set to {_context_limit:,} tokens.{C.RST}\n")
+                    except ValueError:
+                        print(f"{C.ERR}Usage: /context-limit <number>   e.g. /context-limit 80000{C.RST}\n")
+                continue
+
+            # ── Quick utility commands ────────────────────────────────────────
+            if cmd == "/clear":
+                os.system("clear" if os.name != "nt" else "cls")
+                print_startup_banner(AVAILABLE_MODELS[active_model_idx]["label"], compact=compact)
+                print()
+                continue
+
+            if cmd == "/model-info":
+                sel = AVAILABLE_MODELS[active_model_idx]
+                _mi_key = sel.get("claude_model") or sel.get("name", "")
+                _mi_pr = _MODEL_PRICING.get(_mi_key)
+                _mi_price = (
+                    f"${_mi_pr[0]}/1M in, ${_mi_pr[1]}/1M out" if _mi_pr else "no pricing data"
+                )
+                print(
+                    f"{C.DIM}Model:{C.RST}   {sel['label']}  {C.DIM}({sel['name']}){C.RST}\n"
+                    f"{C.DIM}Group:{C.RST}   {sel['group']}\n"
+                    f"{C.DIM}Mode:{C.RST}    {sel['mode']}\n"
+                    f"{C.DIM}Effort:{C.RST}  {current_effort}\n"
+                    f"{C.DIM}Plan:{C.RST}    {'on' if plan_mode else 'off'}\n"
+                    f"{C.DIM}Price:{C.RST}   {_mi_price}\n"
+                    f"{C.DIM}Cost:{C.RST}    session ~${_session_cost_usd:.4f} USD  "
+                    f"({_session_input_tokens:,} in / {_session_output_tokens:,} out tokens)\n"
+                    f"{C.DIM}Ctx:{C.RST}     limit {_context_limit:,} tokens  "
+                    f"{'(auto-trim on)' if _context_limit > 0 else '(disabled)'}\n"
+                )
+                continue
+
+            _route_after_cmd = False
+
+            if cmd == "/retry":
+                if not last_user_input:
+                    print(f"{C.ERR}No previous message to retry.{C.RST}\n")
+                    continue
+                user = last_user_input
+                _route_after_cmd = True
+            elif cmd == "/copy":
+                if not last_ai_reply:
+                    print(f"{C.ERR}No AI response to copy yet.{C.RST}\n")
+                    continue
+                try:
+                    import pyperclip  # type: ignore[import]
+                    pyperclip.copy(last_ai_reply)
+                    print(f"{C.OK}Copied to clipboard.{C.RST}\n")
+                except ImportError:
+                    print(f"{C.ERR}pyperclip not installed. Run: pip install pyperclip{C.RST}\n")
+                continue
+            elif cmd == "/word-count":
+                if not last_ai_reply:
+                    print(f"{C.ERR}No AI response yet.{C.RST}\n")
+                    continue
+                words = len(last_ai_reply.split())
+                chars = len(last_ai_reply)
+                print(f"{C.DIM}Words: {words}  Characters: {chars}{C.RST}\n")
+                continue
+            elif cmd == "/timestamps":
+                t = rest.strip().lower()
+                if t == "on":
+                    show_timestamps = True
+                    print(f"{C.OK}Timestamps ON{C.RST}\n")
+                elif t == "off":
+                    show_timestamps = False
+                    print(f"{C.OK}Timestamps OFF{C.RST}\n")
+                elif t:
+                    print(f"{C.ERR}Usage: /timestamps on|off{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Timestamps: {'on' if show_timestamps else 'off'}{C.RST}\n")
+                continue
+            elif cmd == "/highlight":
+                t = rest.strip().lower()
+                if t == "on":
+                    highlight_enabled = True
+                    print(f"{C.OK}Highlight ON{C.RST} {C.DIM}(code blocks re-rendered after response){C.RST}\n")
+                elif t == "off":
+                    highlight_enabled = False
+                    print(f"{C.OK}Highlight OFF{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Highlight: {'on' if highlight_enabled else 'off'}{C.RST}\n")
+                continue
+            elif cmd == "/tokens":
+                t = rest.strip().lower()
+                if t == "on":
+                    show_tokens = True
+                    save_tokens_setting(True)
+                    print(f"{C.OK}Token display ON{C.RST}\n")
+                elif t == "off":
+                    show_tokens = False
+                    save_tokens_setting(False)
+                    print(f"{C.OK}Token display OFF{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Token display: {'on' if show_tokens else 'off'}{C.RST}\n")
+                continue
+
+            # ── Memory ────────────────────────────────────────────────────────
+            elif cmd == "/remember":
+                if not rest.strip():
+                    print(f"{C.ERR}Usage: /remember <text>{C.RST}\n")
+                    continue
+                mid = save_memory(rest.strip())
+                _memories[mid] = {"id": mid, "content": rest.strip()}
+                _mem_texts = [m["content"] for m in _memories.values()]
+                history[0]["content"] = build_system_prompt(workspace, _mem_texts, personality=_personality)
+                print(f"{C.OK}Memory saved{C.RST} {C.DIM}(id: {mid}){C.RST}\n")
+                continue
+            elif cmd == "/memory":
+                _msub = rest.strip()
+                if _msub.lower().startswith("search "):
+                    _mquery = _msub[7:].strip()
+                    _mems = load_memories()
+                    if not _mems:
+                        print(f"{C.DIM}No memories to search.{C.RST}\n")
+                    else:
+                        _terms = set(_mquery.lower().split())
+                        _matches = [
+                            (_mid, _m) for _mid, _m in _mems.items()
+                            if any(t in _m["content"].lower() for t in _terms)
+                        ]
+                        if not _matches:
+                            print(f"{C.DIM}No memories match '{_mquery}'.{C.RST}\n")
+                        else:
+                            print(f"{C.DIM}Found {len(_matches)} match(es):{C.RST}")
+                            for _mid, _m in _matches:
+                                print(f"  {C.DIM}{_mid}{C.RST}  {_m['content']}")
+                            print()
+                else:
+                    _mems = load_memories()
+                    if not _mems:
+                        print(f"{C.DIM}No memories saved yet.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Memories:{C.RST}")
+                        for _mid, _m in _mems.items():
+                            print(f"  {C.DIM}{_mid}{C.RST}  {_m['content']}")
+                        print()
+                continue
+            elif cmd == "/forget":
+                _fid = rest.strip()
+                if not _fid:
+                    print(f"{C.ERR}Usage: /forget <id>{C.RST}\n")
+                    continue
+                if remove_memory(_fid):
+                    _memories.pop(_fid, None)
+                    _mem_texts = [m["content"] for m in _memories.values()]
+                    history[0]["content"] = build_system_prompt(workspace, _mem_texts, personality=_personality)
+                    print(f"{C.OK}Memory {_fid} removed.{C.RST}\n")
+                else:
+                    print(f"{C.ERR}Memory ID '{_fid}' not found.{C.RST}\n")
+                continue
+
+            # ── Prompt library ────────────────────────────────────────────────
+            elif cmd == "/prompt-save":
+                _parts = rest.split(None, 1)
+                if not _parts:
+                    print(f"{C.ERR}Usage: /prompt-save <name> [text]{C.RST}\n")
+                    continue
+                _pname = _parts[0]
+                if len(_parts) > 1:
+                    _ptext = _parts[1]
+                elif last_user_input:
+                    _ptext = last_user_input
+                    print(f"{C.DIM}Saving last message as prompt '{_pname}'.{C.RST}")
+                else:
+                    print(f"{C.ERR}No text to save. Provide text after the name.{C.RST}\n")
+                    continue
+                save_prompt(_pname, _ptext)
+                print(f"{C.OK}Prompt '{_pname}' saved.{C.RST}\n")
+                continue
+            elif cmd == "/prompt-run":
+                _pname = rest.strip()
+                if not _pname:
+                    print(f"{C.ERR}Usage: /prompt-run <name>{C.RST}\n")
+                    continue
+                _stored = load_prompts()
+                if _pname not in _stored:
+                    print(f"{C.ERR}Prompt '{_pname}' not found.{C.RST}\n")
+                    continue
+                user = _stored[_pname]
+                print(f"{C.DIM}Running prompt: {user}{C.RST}")
+                _route_after_cmd = True
+            elif cmd == "/prompts":
+                _sub = rest.strip().lower()
+                _stored = load_prompts()
+                if _sub.startswith("remove "):
+                    _pname = _sub[7:].strip()
+                    if remove_prompt(_pname):
+                        print(f"{C.OK}Prompt '{_pname}' removed.{C.RST}\n")
+                    else:
+                        print(f"{C.ERR}Prompt '{_pname}' not found.{C.RST}\n")
+                elif not _stored:
+                    print(f"{C.DIM}No prompts saved yet.{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Saved prompts:{C.RST}")
+                    for _n, _t in _stored.items():
+                        _preview = _t[:60].replace("\n", " ")
+                        print(f"  {C.OK}{_n}{C.RST}  {C.DIM}{_preview}{'…' if len(_t) > 60 else ''}{C.RST}")
+                    print()
+                if not _sub.startswith("remove "):
+                    continue
+                else:
+                    continue
+
+            # ── Aliases ───────────────────────────────────────────────────────
+            elif cmd == "/alias":
+                _parts = rest.split(None, 1)
+                if len(_parts) < 2:
+                    print(f"{C.ERR}Usage: /alias <trigger> <command>{C.RST}\n")
+                    continue
+                _atrig, _acmd = _parts[0], _parts[1]
+                if not _atrig.startswith("/"):
+                    _atrig = "/" + _atrig
+                save_alias(_atrig, _acmd)
+                _aliases[_atrig] = _acmd
+                print(f"{C.OK}Alias saved:{C.RST} {_atrig} → {_acmd}\n")
+                continue
+            elif cmd == "/aliases":
+                _als = load_aliases()
+                if not _als:
+                    print(f"{C.DIM}No aliases saved yet.{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Aliases:{C.RST}")
+                    for _t, _c in _als.items():
+                        print(f"  {C.OK}{_t}{C.RST} → {_c}")
+                    print()
+                continue
+            elif cmd == "/alias-remove":
+                _atrig = rest.strip()
+                if not _atrig:
+                    print(f"{C.ERR}Usage: /alias-remove <trigger>{C.RST}\n")
+                    continue
+                if not _atrig.startswith("/"):
+                    _atrig = "/" + _atrig
+                if remove_alias(_atrig):
+                    _aliases.pop(_atrig, None)
+                    print(f"{C.OK}Alias '{_atrig}' removed.{C.RST}\n")
+                else:
+                    print(f"{C.ERR}Alias '{_atrig}' not found.{C.RST}\n")
+                continue
+
+            # ── Session history ───────────────────────────────────────────────
+            elif cmd == "/history":
+                _hsub = rest.strip()
+                if _hsub.lower().startswith("search "):
+                    _query = _hsub[7:].strip()
+                    _matches = search_chats(_query)
+                    if not _matches:
+                        print(f"{C.DIM}No saved sessions matched '{_query}'.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Search results for '{_query}':{C.RST}")
+                        for _s in _matches:
+                            _nmsg = len(_s.get("messages", []))
+                            _preview = _s.get("_preview", "")
+                            print(
+                                f"  {C.OK}{_s['id']}{C.RST}  "
+                                f"{C.DIM}{_s.get('model', '?')}  {_nmsg} messages{C.RST}"
+                            )
+                            if _preview:
+                                print(f"    {C.DIM}{_preview}{C.RST}")
+                        print()
+                else:
+                    _sessions = list_sessions()
+                    if not _sessions:
+                        print(f"{C.DIM}No saved sessions.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Saved sessions:{C.RST}")
+                        for _s in _sessions:
+                            _nmsg = len(_s.get("messages", []))
+                            print(
+                                f"  {C.OK}{_s['id']}{C.RST}  "
+                                f"{C.DIM}{_s.get('model', '?')}  {_nmsg} messages{C.RST}"
+                            )
+                        print()
+                continue
+            elif cmd == "/resume":
+                _sid = rest.strip()
+                if not _sid:
+                    print(f"{C.ERR}Usage: /resume <session-id>{C.RST}\n")
+                    continue
+                _sdata = load_session(_sid)
+                if not _sdata:
+                    print(f"{C.ERR}Session '{_sid}' not found.{C.RST}\n")
+                    continue
+                _msgs = _sdata.get("messages", [])
+                history.clear()
+                history.append({"role": "system", "content": system_prompt})
+                history.extend(_msgs)
+                _session_id = _sid
+                print(
+                    f"{C.OK}Session loaded:{C.RST} {_sid}  "
+                    f"{C.DIM}({len(_msgs)} messages){C.RST}\n"
+                )
+                continue
+            elif cmd == "/export":
+                _fpath = rest.strip()
+                if not _fpath:
+                    _exp_ts = datetime.now().strftime("%Y-%m-%d-%H-%M")
+                    _fpath = str(Path.home() / f"mahanai-export-{_exp_ts}.md")
+                _out_path = Path(_fpath).expanduser().resolve()
+                _exp_model = AVAILABLE_MODELS[active_model_idx]["label"]
+                _exp_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+                _lines = [
+                    "# MahanAI Chat Export",
+                    "",
+                    f"_Model: {_exp_model} · Exported: {_exp_date}_",
+                    "",
+                    "---",
+                    "",
+                ]
+                for _m in history:
+                    if _m["role"] == "system":
+                        continue
+                    _role = "**You**" if _m["role"] == "user" else "**MahanAI**"
+                    _content = _m.get("content", "")
+                    if isinstance(_content, list):
+                        _content = "\n".join(
+                            p.get("text", "") for p in _content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    _lines.append(f"{_role}:\n\n{_content}\n\n---\n")
+                _out_path.write_text("\n".join(_lines), encoding="utf-8")
+                print(f"{C.OK}Exported to:{C.RST} {_out_path}\n")
+                continue
+
+            # ── Model comparison ──────────────────────────────────────────────
+            elif cmd == "/compare":
+                _cparts = rest.split(None, 2)
+                if len(_cparts) < 3:
+                    print(f"{C.ERR}Usage: /compare <model1> <model2> <message>{C.RST}\n")
+                    continue
+                _cm1_name, _cm2_name, _cmsg = _cparts[0], _cparts[1], _cparts[2]
+                _cm1 = next((i for i, m in enumerate(AVAILABLE_MODELS) if _cm1_name.lower() in m["name"].lower() or _cm1_name.lower() in m["label"].lower()), None)
+                _cm2 = next((i for i, m in enumerate(AVAILABLE_MODELS) if _cm2_name.lower() in m["name"].lower() or _cm2_name.lower() in m["label"].lower()), None)
+                if _cm1 is None:
+                    print(f"{C.ERR}Model '{_cm1_name}' not found. Use /models to see names.{C.RST}\n")
+                    continue
+                if _cm2 is None:
+                    print(f"{C.ERR}Model '{_cm2_name}' not found. Use /models to see names.{C.RST}\n")
+                    continue
+                for _cidx, _cidx_val in [(_cm1, _cm1_name), (_cm2, _cm2_name)]:
+                    _csel = AVAILABLE_MODELS[_cidx]
+                    print(f"\n{C.BOT}── {_csel['label']} ──{C.RST}")
+                    print(f"{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+                    _t0 = time.time()
+                    if _csel["mode"] == "claude":
+                        _run_claude_cli(_cmsg, model=_csel.get("claude_model"))
+                    elif _csel["mode"] == "nvidia_direct" and nvidia_api_key:
+                        _stream_direct(nvidia_api_key, [{"role": "user", "content": _cmsg}], _csel["name"], NVIDIA_DIRECT_URL)
+                    elif _csel["mode"] in ("server",) and api_key:
+                        _stream_direct(api_key, [{"role": "user", "content": _cmsg}], model, NVIDIA_BASE_URL)
+                    elif _csel["mode"] == "ollama":
+                        _stream_direct(_csel.get("ollama_api_key") or _OLLAMA_DEFAULT_API_KEY, [{"role": "user", "content": _cmsg}], _csel["name"], _csel["ollama_url"])
+                    print(f"\n{C.DIM}({time.time() - _t0:.1f}s){C.RST}")
+                print()
+                continue
+
+            # ── Document index ────────────────────────────────────────────────
+            elif cmd == "/index":
+                _isub = rest.strip()
+                if _isub == "list":
+                    _sources = sorted({c["source"] for c in _index_chunks})
+                    if not _sources:
+                        print(f"{C.DIM}Index is empty.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Indexed sources ({len(_index_chunks)} chunks):{C.RST}")
+                        for _src in _sources:
+                            _cnt = sum(1 for c in _index_chunks if c["source"] == _src)
+                            print(f"  {C.OK}{_src}{C.RST}  {C.DIM}({_cnt} chunks){C.RST}")
+                        print()
+                elif _isub == "clear":
+                    _index_chunks.clear()
+                    save_index_documents([])
+                    print(f"{C.OK}Index cleared.{C.RST}\n")
+                elif _isub:
+                    _ipath = Path(_isub).expanduser().resolve()
+                    if not _ipath.exists():
+                        print(f"{C.ERR}Path not found: {_isub}{C.RST}\n")
+                    else:
+                        _count = 0
+                        if _ipath.is_file():
+                            _count = _index_file(_ipath, _index_chunks)
+                        elif _ipath.is_dir():
+                            for _f in _ipath.rglob("*"):
+                                if _f.is_file() and _f.suffix in (".txt", ".md", ".py", ".js", ".ts", ".rs", ".go", ".java", ".c", ".cpp", ".cs", ".rb", ".json", ".yaml", ".toml", ".sh"):
+                                    _count += _index_file(_f, _index_chunks)
+                        save_index_documents(_index_chunks)
+                        print(f"{C.OK}Indexed:{C.RST} {_isub}  {C.DIM}({_count} new chunks, {len(_index_chunks)} total){C.RST}\n")
+                else:
+                    print(f"{C.ERR}Usage: /index <path>  |  /index list  |  /index clear{C.RST}\n")
+                continue
+
+            # ── Background tasks ──────────────────────────────────────────────
+            elif cmd == "/task":
+                if not rest.strip():
+                    print(f"{C.ERR}Usage: /task <description>{C.RST}\n")
+                    continue
+                _tid = uuid.uuid4().hex[:8]
+                _sel = AVAILABLE_MODELS[active_model_idx]
+                if _sel["mode"] == "nvidia_direct" and nvidia_api_key:
+                    _tkey, _turl, _tmodel = nvidia_api_key, NVIDIA_DIRECT_URL, _sel["name"]
+                elif _sel["mode"] in ("server",) and api_key:
+                    _tkey, _turl, _tmodel = api_key, NVIDIA_BASE_URL, model
+                elif _sel["mode"] == "ollama":
+                    _tkey = _sel.get("ollama_api_key") or _OLLAMA_DEFAULT_API_KEY
+                    _turl = _sel["ollama_url"]
+                    _tmodel = _sel["name"]
+                elif _sel["mode"] == "custom":
+                    _cfg = load_custom_endpoint()
+                    if not _cfg:
+                        print(f"{C.ERR}No custom endpoint configured.{C.RST}\n")
+                        continue
+                    _tkey, _turl, _tmodel = _cfg["api_key"] or "none", _cfg["url"], _cfg["model"]
+                else:
+                    print(f"{C.ERR}Background tasks require a non-Claude endpoint.{C.RST}\n")
+                    continue
+                _tasks[_tid] = {"id": _tid, "description": rest.strip(), "status": "pending", "result": ""}
+                _t = threading.Thread(target=_run_task_thread, args=(_tid, rest.strip(), _tkey, _turl, _tmodel), daemon=True)
+                _t.start()
+                print(f"{C.OK}Task started:{C.RST} {C.DIM}{_tid}{C.RST}  Use /task-status to check.\n")
+                continue
+            elif cmd == "/task-status":
+                if not _tasks:
+                    print(f"{C.DIM}No background tasks.{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Tasks:{C.RST}")
+                    for _tid, _t_data in _tasks.items():
+                        _st = _t_data["status"]
+                        _st_color = C.OK if _st == "done" else C.ERR if _st == "error" else C.DIM
+                        print(f"  {C.DIM}{_tid}{C.RST}  {_st_color}{_st}{C.RST}  {C.DIM}{_t_data['description'][:50]}{C.RST}")
+                    print()
+                continue
+            elif cmd == "/task-result":
+                _tid = rest.strip()
+                if not _tid:
+                    print(f"{C.ERR}Usage: /task-result <id>{C.RST}\n")
+                    continue
+                if _tid not in _tasks:
+                    print(f"{C.ERR}Task '{_tid}' not found.{C.RST}\n")
+                    continue
+                _td = _tasks[_tid]
+                if _td["status"] == "pending":
+                    print(f"{C.DIM}Task still pending...{C.RST}\n")
+                elif _td["status"] == "running":
+                    print(f"{C.DIM}Task still running...{C.RST}\n")
+                else:
+                    print(f"\n{C.BOT}{C.AI_NAME}{C.RST}:\n{_td['result']}\n")
+                continue
+
+            # ── Voice ─────────────────────────────────────────────────────────
+            elif cmd == "/voice":
+                _vt = rest.strip().lower()
+                if _vt == "on":
+                    voice_enabled = True
+                    print(f"{C.OK}Voice input ON{C.RST} {C.DIM}(requires SpeechRecognition + whisper){C.RST}\n")
+                elif _vt == "off":
+                    voice_enabled = False
+                    print(f"{C.OK}Voice input OFF{C.RST}\n")
+                else:
+                    print(f"{C.DIM}Voice: {'on' if voice_enabled else 'off'}{C.RST}\n")
+                continue
+
+            # ── Roles / personas ──────────────────────────────────────────────
+            elif cmd == "/role":
+                _rparts = rest.split(None, 1)
+                _rsub = _rparts[0].lower() if _rparts else ""
+                _rarg = _rparts[1].strip() if len(_rparts) > 1 else ""
+                if _rsub == "save":
+                    if not _rarg:
+                        print(f"{C.ERR}Usage: /role save <name>{C.RST}\n")
+                    else:
+                        _rprompt = input(
+                            f"  System prompt for '{_rarg}' (Enter to save current): "
+                        ).strip()
+                        if not _rprompt:
+                            _rprompt = system_prompt
+                        save_role(_rarg, _rprompt)
+                        print(f"{C.OK}Role '{_rarg}' saved.{C.RST}\n")
+                elif _rsub == "load":
+                    if not _rarg:
+                        print(f"{C.ERR}Usage: /role load <name>{C.RST}\n")
+                    else:
+                        _built = _BUILT_IN_ROLES.get(_rarg)
+                        _saved = load_roles().get(_rarg)
+                        _rprompt = _built or _saved
+                        if not _rprompt:
+                            print(f"{C.ERR}Role '{_rarg}' not found. Use /role list.{C.RST}\n")
+                        else:
+                            system_prompt = _rprompt
+                            history[0]["content"] = system_prompt
+                            print(f"{C.OK}Role '{_rarg}' loaded.{C.RST}\n")
+                elif _rsub == "list":
+                    print(f"{C.DIM}Built-in roles:{C.RST}")
+                    for _rn in _BUILT_IN_ROLES:
+                        print(f"  {C.OK}{_rn}{C.RST}")
+                    _saved_roles = load_roles()
+                    if _saved_roles:
+                        print(f"{C.DIM}Saved roles:{C.RST}")
+                        for _rn in _saved_roles:
+                            print(f"  {C.OK}{_rn}{C.RST}")
+                    print()
+                elif _rsub == "remove":
+                    if not _rarg:
+                        print(f"{C.ERR}Usage: /role remove <name>{C.RST}\n")
+                    elif remove_role(_rarg):
+                        print(f"{C.OK}Role '{_rarg}' removed.{C.RST}\n")
+                    else:
+                        print(f"{C.ERR}Role '{_rarg}' not found.{C.RST}\n")
+                else:
+                    print(
+                        f"{C.DIM}Role commands:{C.RST}\n"
+                        f"  /role save <name>    Save current or typed system prompt as a role\n"
+                        f"  /role load <name>    Switch to a saved role\n"
+                        f"  /role list           List built-in and saved roles\n"
+                        f"  /role remove <name>  Delete a saved role\n"
+                    )
+                continue
+
+            # ── Workflow macros ───────────────────────────────────────────────
+            elif cmd == "/macro":
+                _mparts = rest.split(None, 1)
+                _msub2 = _mparts[0].lower() if _mparts else ""
+                _marg2 = _mparts[1].strip() if len(_mparts) > 1 else ""
+                if _msub2 == "record":
+                    if not _marg2:
+                        print(f"{C.ERR}Usage: /macro record <name>{C.RST}\n")
+                    elif _macro_recording:
+                        print(f"{C.WARN}Already recording '{_macro_recording}'. Use /macro stop first.{C.RST}\n")
+                    else:
+                        _macro_recording = _marg2
+                        _macro_steps.clear()
+                        print(f"{C.OK}Recording macro '{_marg2}'.{C.RST} {C.DIM}Run commands — /macro stop to finish.{C.RST}\n")
+                elif _msub2 == "stop":
+                    if not _macro_recording:
+                        print(f"{C.ERR}Not recording a macro.{C.RST}\n")
+                    else:
+                        save_macro(_macro_recording, _macro_steps[:])
+                        print(f"{C.OK}Macro '{_macro_recording}' saved ({len(_macro_steps)} steps).{C.RST}\n")
+                        _macro_recording = None
+                        _macro_steps.clear()
+                elif _msub2 == "run":
+                    if not _marg2:
+                        print(f"{C.ERR}Usage: /macro run <name>{C.RST}\n")
+                    else:
+                        _mcros = load_macros()
+                        if _marg2 not in _mcros:
+                            print(f"{C.ERR}Macro '{_marg2}' not found.{C.RST}\n")
+                        else:
+                            _steps = _mcros[_marg2]
+                            print(f"{C.DIM}Replaying macro '{_marg2}' ({len(_steps)} steps)...{C.RST}\n")
+                            _input_queue.extend(_steps)
+                elif _msub2 == "list":
+                    _mcros = load_macros()
+                    if not _mcros:
+                        print(f"{C.DIM}No macros saved.{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Macros:{C.RST}")
+                        for _mn, _ms in _mcros.items():
+                            print(f"  {C.OK}{_mn}{C.RST}  {C.DIM}({len(_ms)} steps){C.RST}")
+                        print()
+                elif _msub2 == "remove":
+                    if not _marg2:
+                        print(f"{C.ERR}Usage: /macro remove <name>{C.RST}\n")
+                    elif remove_macro(_marg2):
+                        print(f"{C.OK}Macro '{_marg2}' removed.{C.RST}\n")
+                    else:
+                        print(f"{C.ERR}Macro '{_marg2}' not found.{C.RST}\n")
+                else:
+                    rec_status = f"  {C.WARN}(recording: {_macro_recording}){C.RST}" if _macro_recording else ""
+                    print(
+                        f"{C.DIM}Macro commands:{C.RST}{rec_status}\n"
+                        f"  /macro record <name>  Start recording a macro\n"
+                        f"  /macro stop           Stop recording and save\n"
+                        f"  /macro run <name>     Replay a saved macro\n"
+                        f"  /macro list           List saved macros\n"
+                        f"  /macro remove <name>  Delete a macro\n"
+                    )
+                continue
+
+            # ── File/image attachment ─────────────────────────────────────────
+            elif cmd == "/attach":
+                _aarg = rest.strip()
+                if not _aarg:
+                    if _attached_file:
+                        print(f"{C.OK}Attached:{C.RST} {_attached_file}  {C.DIM}(/attach clear to remove){C.RST}\n")
+                    else:
+                        print(f"{C.ERR}Usage: /attach <path>   or   /attach clear{C.RST}\n")
+                elif _aarg.lower() == "clear":
+                    _attached_file = None
+                    _pending_image = None
+                    print(f"{C.OK}Attachment cleared.{C.RST}\n")
+                else:
+                    _ap2 = Path(_aarg).expanduser().resolve()
+                    if not _ap2.is_file():
+                        print(f"{C.ERR}File not found: {_aarg}{C.RST}\n")
+                    else:
+                        _attached_file = _ap2
+                        print(f"{C.OK}Attached:{C.RST} {_ap2}  {C.DIM}(included in next message){C.RST}\n")
+                continue
+
+            # ── Interactive Python REPL ───────────────────────────────────────
+            elif cmd == "/repl":
+                print(f"{C.DIM}Opening Python REPL (Ctrl+D / Ctrl+Z to exit)...{C.RST}")
+                try:
+                    subprocess.run([sys.executable], cwd=str(workspace))
+                except Exception as _re:
+                    print(f"{C.ERR}Could not start Python REPL: {_re}{C.RST}\n")
+                continue
+
+            # ── Audit log ─────────────────────────────────────────────────────
+            elif cmd == "/audit":
+                _alog = audit_log_path()
+                if not _alog.is_file():
+                    print(f"{C.DIM}No audit log yet. Tool executions are logged here:{C.RST} {_alog}\n")
+                else:
+                    _alines = _alog.read_text(encoding="utf-8").splitlines()
+                    _show_n = 50
+                    _tail = _alines[-_show_n:]
+                    print(f"{C.DIM}Last {len(_tail)} audit entries (of {len(_alines)} total):{C.RST}")
+                    for _al in _tail:
+                        print(f"  {C.DIM}{_al}{C.RST}")
+                    print(f"\n{C.DIM}Full log: {_alog}{C.RST}\n")
+                continue
+
+            # ── Shell init ────────────────────────────────────────────────────
+            elif cmd == "/shell-init":
+                _shell = rest.strip().lower()
+                if _shell == "fish":
+                    print(f"\n{C.DIM}Add to ~/.config/fish/config.fish:{C.RST}\n")
+                    print(_SHELL_INIT_FISH)
+                elif _shell in ("bash", "zsh", ""):
+                    print(f"\n{C.DIM}Add to ~/.bashrc or ~/.zshrc:{C.RST}\n")
+                    print(_SHELL_INIT_BASH)
+                else:
+                    print(f"{C.ERR}Unknown shell {_shell!r}.{C.RST} Supported: {C.DIM}bash{C.RST}, {C.DIM}zsh{C.RST}, {C.DIM}fish{C.RST}.\n")
+                continue
+
+            # ── Autonomous mode ───────────────────────────────────────────────
+            elif cmd == "/auto":
+                _auto_sub = rest.strip().lower()
+                if _auto_sub in ("on", "1", "true"):
+                    set_autonomous_mode(True)
+                    print(
+                        f"{C.WARN}Autonomous mode ON.{C.RST} "
+                        f"{C.DIM}Tool calls will be auto-approved (destructive commands still require approval).{C.RST}\n"
+                    )
+                elif _auto_sub in ("off", "0", "false", ""):
+                    set_autonomous_mode(False)
+                    print(f"{C.OK}Autonomous mode OFF.{C.RST} {C.DIM}Normal approval prompts restored.{C.RST}\n")
+                else:
+                    _auto_state = "ON" if is_autonomous_mode() else "OFF"
+                    print(f"{C.DIM}Autonomous mode is {_auto_state}. Use /auto on|off to toggle.{C.RST}\n")
+                continue
+
+            # ── Vim keybindings ───────────────────────────────────────────────
+            elif cmd == "/interact":
+                _ia_sub = rest.strip().lower()
+                if _ia_sub == "remove":
+                    save_interact_enabled(False)
+                    save_interact_always_allow(False)
+                    print(f"{C.OK}Interact removed.{C.RST} {C.DIM}Computer-control tools are disabled.{C.RST}\n")
+                    continue
+
+                ok, msg = _ensure_interact_dependencies()
+                if not ok:
+                    print(f"{C.ERR}Interact setup failed:{C.RST} {msg}\n")
+                    continue
+                save_interact_enabled(True)
+                save_interact_always_allow(True)
+                print(
+                    f"{C.OK}Interact enabled.{C.RST} "
+                    f"{C.DIM}MahanAI can now use screenshots, mouse, and keyboard controls on future runs without approval prompts.{C.RST}\n"
+                )
+                continue
+
+            elif cmd == "/vim":
+                _vim_sub = rest.strip().lower()
+                if _vim_sub in ("on", "1", "true"):
+                    if _set_vim_mode(True):
+                        vim_mode = True
+                        print(f"{C.OK}Vim keybindings ON.{C.RST} {C.DIM}(Esc → normal mode, i → insert){C.RST}\n")
+                    else:
+                        print(f"{C.ERR}readline not available — vim mode not supported on this platform.{C.RST}\n")
+                elif _vim_sub in ("off", "0", "false", ""):
+                    _set_vim_mode(False)
+                    vim_mode = False
+                    print(f"{C.OK}Vim keybindings OFF.{C.RST} {C.DIM}(back to emacs/default mode){C.RST}\n")
+                else:
+                    _vim_state = "ON" if vim_mode else "OFF"
+                    print(f"{C.DIM}Vim mode is {_vim_state}. Use /vim on|off to toggle.{C.RST}\n")
+                continue
+
+            # ── Desktop notification ──────────────────────────────────────────
+            elif cmd == "/notify":
+                _ntitle = rest.strip() or "MahanAI"
+                _send_notification(_ntitle, "Test notification from MahanAI.")
+                print(f"{C.OK}Notification sent.{C.RST} {C.DIM}({_ntitle}){C.RST}\n")
+                continue
+
+            # ── Shell history ─────────────────────────────────────────────────
+            elif cmd == "/shell-history":
+                _sh_sub = rest.strip().lower()
+                if _sh_sub == "inject":
+                    _sh_cmds = _get_shell_history(20)
+                    if not _sh_cmds:
+                        print(f"{C.WARN}No shell history found.{C.RST}\n")
+                    else:
+                        _sh_block = "\n".join(f"$ {c}" for c in _sh_cmds)
+                        history[0]["content"] += f"\n\n--- Recent Shell History ---\n{_sh_block}\n---"
+                        shell_history_inject = True
+                        print(f"{C.OK}Shell history injected into context.{C.RST} {C.DIM}({len(_sh_cmds)} commands){C.RST}\n")
+                elif _sh_sub == "clear":
+                    shell_history_inject = False
+                    system_prompt = build_system_prompt(workspace, _mem_texts, rc_extras=_rc_extras, personality=_personality)
+                    history[0]["content"] = system_prompt
+                    print(f"{C.OK}Shell history removed from context.{C.RST}\n")
+                else:
+                    _sh_cmds = _get_shell_history(20)
+                    if not _sh_cmds:
+                        print(f"{C.WARN}No shell history found (~/.bash_history or ~/.zsh_history).{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}Recent shell history:{C.RST}")
+                        for _sh_i, _sh_c in enumerate(_sh_cmds, 1):
+                            print(f"  {C.DIM}{_sh_i:2}.{C.RST} {_sh_c}")
+                        print(f"\n{C.DIM}Use /shell-history inject to add to context, /shell-history clear to remove.{C.RST}\n")
+                continue
+
+            # ── .mahanairc reload ─────────────────────────────────────────────
+            elif cmd == "/mahanairc":
+                _rc_reload_path = workspace / ".mahanairc"
+                if not _rc_reload_path.is_file():
+                    print(f"{C.ERR}No .mahanairc found in {workspace}{C.RST}\n")
+                else:
+                    try:
+                        _rc_config = parse_rc_file(_rc_reload_path)
+                        _rc_extras = _rc_config.system_extras[:]
+                        system_prompt = build_system_prompt(workspace, _mem_texts, rc_extras=_rc_extras, personality=_personality)
+                        history[0]["content"] = system_prompt
+                        print(f"{C.OK}.mahanairc reloaded.{C.RST}")
+                        if _rc_config.warnings:
+                            for _w in _rc_config.warnings:
+                                print(f"{C.WARN}  {_w}{C.RST}")
+                        print()
+                    except Exception as _rc_rel_err:
+                        print(f"{C.ERR}.mahanairc reload failed: {_rc_rel_err}{C.RST}\n")
+                continue
+
+            # ── Personality ────────────────────────────────────────────────────
+            elif cmd == "/personality":
+                _psub = rest.strip().lower()
+                if _psub == "reload":
+                    _personality, _personality_source = load_personality(workspace)
+                    system_prompt = build_system_prompt(workspace, _mem_texts, rc_extras=_rc_extras, personality=_personality)
+                    history[0]["content"] = system_prompt
+                    if _personality:
+                        print(f"{C.OK}Personality reloaded.{C.RST} {C.DIM}Source: {_personality_source}{C.RST}\n")
+                    else:
+                        print(f"{C.DIM}No PERSONALITY.md found — personality cleared.{C.RST}\n")
+                else:
+                    if _personality:
+                        print(f"\n{C.OK}Active personality{C.RST} {C.DIM}({_personality_source}){C.RST}\n")
+                        print(f"{C.DIM}{_personality[:400]}{'…' if len(_personality) > 400 else ''}{C.RST}\n")
+                    else:
+                        print(
+                            f"{C.DIM}No personality loaded.{C.RST}\n"
+                            f"  Put a {C.OK}PERSONALITY.md{C.RST} in your working directory for a local personality,\n"
+                            f"  or run {C.OK}/setup-public-personality{C.RST} to create a global one.\n"
+                        )
+                continue
+
+            elif cmd == "/setup-public-personality":
+                GLOBAL_PERSONALITY_DIR.mkdir(parents=True, exist_ok=True)
+                if GLOBAL_PERSONALITY_PATH.is_file():
+                    print(
+                        f"{C.OK}Global PERSONALITY.md already exists:{C.RST}\n"
+                        f"  {C.DIM}{GLOBAL_PERSONALITY_PATH}{C.RST}\n"
+                        f"Edit it to update your personality, then run {C.OK}/personality reload{C.RST}.\n"
+                    )
+                else:
+                    GLOBAL_PERSONALITY_PATH.write_text(_PERSONALITY_TEMPLATE, encoding="utf-8")
+                    print(
+                        f"{C.OK}Created:{C.RST} {C.DIM}{GLOBAL_PERSONALITY_PATH}{C.RST}\n"
+                        f"Edit that file to define your global personality, then run {C.OK}/personality reload{C.RST}.\n"
+                    )
+                continue
+
+            # ── Chat history setup ─────────────────────────────────────────────
+            elif cmd == "/setup-chat-history":
+                _ch_cfg = load_chat_history_config()
+                print(f"\n{C.OK}Chat History Setup{C.RST}\n")
+                print(f"{C.DIM}Universal chats are saved regardless of project.{C.RST}")
+                print(f"{C.DIM}Per-project chats go in a subfolder inside each project root.{C.RST}\n")
+                _default_dir = _ch_cfg["universal_dir"]
+                _raw_udir = input(
+                    f"  Universal chat folder [{_default_dir}]: "
+                ).strip()
+                _udir = _raw_udir or _default_dir
+                _default_folder = _ch_cfg["project_folder_name"]
+                _raw_folder = input(
+                    f"  Per-project subfolder name [{_default_folder}]: "
+                ).strip()
+                _pfolder = _raw_folder or _default_folder
+                save_chat_history_config(_udir, _pfolder)
+                print(
+                    f"\n{C.OK}Saved.{C.RST}  Universal: {C.DIM}{_udir}{C.RST}  "
+                    f"Project subfolder: {C.DIM}{_pfolder}{C.RST}\n"
+                )
+                continue
+
+            # ── Recall a previous chat ─────────────────────────────────────────
+            elif cmd == "/recall":
+                _recall_name = rest.strip()
+                _recall_data = None
+                if _recall_name:
+                    _recall_data = load_chat_by_name(_recall_name, _active_project)
+                    if not _recall_data and _active_project:
+                        _recall_data = load_chat_by_name(_recall_name, None)
+                    if not _recall_data:
+                        # Fall back to filtered selector
+                        _recall_sel = chat_selector(_active_project, filter_term=_recall_name)
+                        if not _recall_sel:
+                            print(f"{C.DIM}No chats matching '{_recall_name}' found.{C.RST}\n")
+                            continue
+                        _recall_data = load_chat_by_name(_recall_sel, _active_project)
+                        _recall_name = _recall_sel
+                else:
+                    _recall_name = chat_selector(_active_project)
+                    if not _recall_name:
+                        print(f"{C.DIM}Cancelled.{C.RST}\n")
+                        continue
+                    _recall_data = load_chat_by_name(_recall_name, _active_project)
+                if not _recall_data:
+                    print(f"{C.ERR}Chat not found.{C.RST}\n")
+                    continue
+                _recall_msgs = _recall_data.get("messages", [])
+                _recall_context = (
+                    f"--- Recalled chat: {_recall_data['name']} "
+                    f"({len(_recall_msgs)} messages) ---\n"
+                )
+                for _rm in _recall_msgs:
+                    _rrole = "User" if _rm["role"] == "user" else "Assistant"
+                    _rcontent = _rm.get("content", "")
+                    if isinstance(_rcontent, list):
+                        _rcontent = " ".join(
+                            p.get("text", "") for p in _rcontent
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    _recall_context += f"{_rrole}: {_rcontent}\n"
+                _recall_context += "--- End of recalled chat ---"
+                history[0]["content"] += f"\n\n{_recall_context}"
+                print(
+                    f"{C.OK}Recalled:{C.RST} {_recall_data['name']}  "
+                    f"{C.DIM}({len(_recall_msgs)} messages injected into context){C.RST}\n"
+                )
+                continue
+
+            # ── Rename current chat ────────────────────────────────────────────
+            elif cmd == "/rename-chat":
+                _rn_new = rest.strip()
+                if not _rn_new:
+                    print(f"{C.ERR}Usage: /rename-chat <new-name>{C.RST}\n")
+                    continue
+                if not _current_chat_name:
+                    print(
+                        f"{C.ERR}No chat saved yet for this session.{C.RST} "
+                        f"Send at least one message first.\n"
+                    )
+                    continue
+                _rn_ok, _rn_safe = rename_chat_file(
+                    _current_chat_name, _rn_new, _active_project
+                )
+                if _rn_ok:
+                    _current_chat_name = _rn_safe
+                    print(f"{C.OK}Chat renamed to:{C.RST} {_rn_safe}\n")
+                else:
+                    print(f"{C.ERR}Could not rename chat.{C.RST}\n")
+                continue
+
+            # ── New project ────────────────────────────────────────────────────
+            elif cmd == "/new-project":
+                import shlex as _shlex
+                try:
+                    _np_parts = _shlex.split(rest)
+                except ValueError:
+                    _np_parts = rest.split()
+                if len(_np_parts) < 3:
+                    print(
+                        f"{C.ERR}Usage: /new-project <path> <project-name> <\"Display Name\">{C.RST}\n"
+                        f"{C.DIM}Example: /new-project ~/myapp myapp \"My Application\"{C.RST}\n"
+                    )
+                    continue
+                _np_path, _np_name, _np_display = _np_parts[0], _np_parts[1], _np_parts[2]
+                _np_resolved = Path(_np_path).expanduser().resolve()
+                if not _np_resolved.exists():
+                    print(
+                        f"{C.WARN}Path does not exist:{C.RST} {_np_resolved}  "
+                        f"{C.DIM}(creating anyway){C.RST}\n"
+                    )
+                save_project(_np_name, str(_np_resolved), _np_display)
+                _ch_cfg = load_chat_history_config()
+                print(
+                    f"{C.OK}Project registered:{C.RST} {_np_display}  "
+                    f"{C.DIM}({_np_name}){C.RST}\n"
+                    f"  Path: {C.DIM}{_np_resolved}{C.RST}\n"
+                    f"  Chats: {C.DIM}{_np_resolved / _ch_cfg['project_folder_name']}{C.RST}\n"
+                    f"  Use {C.OK}/project {_np_name}{C.RST} to activate.\n"
+                )
+                continue
+
+            # ── Project selector ───────────────────────────────────────────────
+            elif cmd == "/project":
+                _proj_arg = rest.strip()
+                _all_projects = load_projects()
+                if not _all_projects:
+                    print(
+                        f"{C.DIM}No projects registered yet.{C.RST} "
+                        f"Use {C.OK}/new-project{C.RST} to add one.\n"
+                    )
+                    continue
+                if _proj_arg:
+                    if _proj_arg not in _all_projects:
+                        # fuzzy
+                        _proj_match = next(
+                            (k for k in _all_projects if _proj_arg.lower() in k.lower()),
+                            None,
+                        )
+                        if not _proj_match:
+                            print(
+                                f"{C.ERR}Project '{_proj_arg}' not found.{C.RST} "
+                                f"Known: {', '.join(_all_projects)}\n"
+                            )
+                            continue
+                        _proj_arg = _proj_match
+                    _active_project = _proj_arg
+                else:
+                    _chosen_proj = project_selector(_active_project)
+                    if not _chosen_proj:
+                        print(f"{C.DIM}Cancelled.{C.RST}\n")
+                        continue
+                    _active_project = _chosen_proj
+                save_active_project(_active_project)
+                _proj_info = _all_projects[_active_project]
+                print(
+                    f"{C.OK}Active project:{C.RST} {_proj_info['display']}  "
+                    f"{C.DIM}({_active_project}){C.RST}\n"
+                    f"  Chats saved to: {C.DIM}{_proj_info['chats_dir']}{C.RST}\n"
+                )
+                # Reset current chat name so next session starts fresh in this project
+                _current_chat_name = None
+                continue
+
+            # ── Delete project ─────────────────────────────────────────────────
+            elif cmd == "/delete-project":
+                _dp_arg = rest.strip()
+                _all_projects = load_projects()
+                if not _all_projects:
+                    print(f"{C.DIM}No projects registered.{C.RST}\n")
+                    continue
+                if not _dp_arg:
+                    _dp_arg = project_selector(_active_project)
+                    if not _dp_arg:
+                        print(f"{C.DIM}Cancelled.{C.RST}\n")
+                        continue
+                if _dp_arg not in _all_projects:
+                    _dp_match = next(
+                        (k for k in _all_projects if _dp_arg.lower() in k.lower()),
+                        None,
+                    )
+                    if not _dp_match:
+                        print(
+                            f"{C.ERR}Project '{_dp_arg}' not found.{C.RST} "
+                            f"Known: {', '.join(_all_projects)}\n"
+                        )
+                        continue
+                    _dp_arg = _dp_match
+                _dp_info = _all_projects[_dp_arg]
+                _dp_confirm = input(
+                    f"  Delete project '{_dp_info['display']}' ({_dp_arg})? "
+                    f"[y/N]: "
+                ).strip().lower()
+                if _dp_confirm != "y":
+                    print(f"{C.DIM}Cancelled.{C.RST}\n")
+                    continue
+                _dp_ok = remove_project(_dp_arg)
+                if _dp_ok:
+                    if _active_project == _dp_arg:
+                        _active_project = None
+                    print(
+                        f"{C.OK}Project deleted:{C.RST} {_dp_info['display']}  "
+                        f"{C.DIM}(chat files kept in {_dp_info['chats_dir']}){C.RST}\n"
+                    )
+                else:
+                    print(f"{C.ERR}Could not delete project.{C.RST}\n")
+                continue
+
+            if not _route_after_cmd:
+                print(f"{C.ERR}Unknown command.{C.RST} Try {C.DIM}/help{C.RST}\n")
+                continue
+
+        # Track last user input for /retry
+        last_user_input = user
+
+        # Apply plan mode and effort modifiers
+        effective_user = user
+        _pending_image = None
+        if plan_mode:
+            effective_user = (
+                "Before responding, briefly outline your plan step by step, then execute it.\n\n"
+                + user
+            )
+
+        # Handle file/image attachment
+        if _attached_file is not None:
+            _att = _attached_file
+            _attached_file = None
+            _IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
+            if _att.suffix.lower() in _IMG_EXTS:
+                import base64 as _b64mod
+                try:
+                    _img_bytes = _att.read_bytes()
+                    _ext_img = _att.suffix.lower().lstrip(".")
+                    _mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg"}
+                    _mime = _mime_map.get(_ext_img, f"image/{_ext_img}")
+                    _b64str = _b64mod.b64encode(_img_bytes).decode("ascii")
+                    _pending_image = {
+                        "type": "image",
+                        "url": f"data:{_mime};base64,{_b64str}",
+                        "path": str(_att),
+                    }
+                    effective_user = f"[Image attached: {_att.name}]\n\n{effective_user}"
+                except Exception as _ie:
+                    print(f"{C.WARN}Could not encode image: {_ie}{C.RST}")
+            else:
+                try:
+                    _ftxt = _att.read_text(encoding="utf-8", errors="replace")[:8000]
+                    effective_user = (
+                        f"[Attached file: {_att.name}]\n```\n{_ftxt}\n```\n\n{effective_user}"
+                    )
+                except Exception as _fe:
+                    print(f"{C.WARN}Could not read file: {_fe}{C.RST}")
+
+        # Inject relevant index chunks as context prefix
+        if _index_chunks:
+            _relevant = _search_index(user, _index_chunks, top_k=3)
+            if _relevant:
+                _ctx = "\n\n".join(f"[Source: {c['source']}]\n{c['text']}" for c in _relevant)
+                effective_user = f"Relevant context from indexed documents:\n{_ctx}\n\n---\n\n{effective_user}"
+
+        selected = AVAILABLE_MODELS[active_model_idx]
+        is_haiku = selected.get("claude_model") == "claude-haiku-4-5-20251001"
+        effort_instr = "" if is_haiku else _EFFORT_INSTRUCTIONS.get(current_effort, "")
+        codex_effort = _EFFORT_CODEX.get(current_effort, "medium")
+
+        def _post_reply(reply: str, input_text: str = "", elapsed: float = 0.0) -> None:
+            """Run after each successful AI reply: highlight, token count, cost, auto-save."""
+            nonlocal last_ai_reply, _session_input_tokens, _session_output_tokens, _session_cost_usd, _current_chat_name
+            last_ai_reply = reply
+            if highlight_enabled:
+                _highlight_response(reply)
+            _in_tok = _estimate_tokens(input_text) if input_text else 0
+            _out_tok = _estimate_tokens(reply)
+            _session_input_tokens += _in_tok
+            _session_output_tokens += _out_tok
+            _model_key = selected.get("claude_model") or selected.get("name", "")
+            _pricing = _MODEL_PRICING.get(_model_key)
+            if _pricing:
+                _turn_cost = (_in_tok * _pricing[0] + _out_tok * _pricing[1]) / 1_000_000
+                _session_cost_usd += _turn_cost
+            else:
+                _turn_cost = 0.0
+            if show_tokens:
+                print(f"{C.DIM}~{_out_tok} tokens{C.RST}\n")
+            if show_cost and _pricing:
+                print(f"{C.DIM}~${_turn_cost:.4f} this turn  (session: ${_session_cost_usd:.4f}){C.RST}\n")
+            # Desktop notification for long responses
+            if elapsed >= _notify_threshold:
+                _send_notification(
+                    "MahanAI",
+                    f"Response ready ({elapsed:.0f}s) — {selected['label']}",
+                )
+            # Context window trim
+            trimmed = _trim_context_if_needed(history, _context_limit)
+            if trimmed:
+                print(f"{C.DIM}[Context trimmed: {trimmed} old messages summarized to stay within {_context_limit:,} token limit]{C.RST}\n")
+            _auto_save_session(_session_id, history, selected["label"])
+            # Auto-save to chat history (universal or project)
+            try:
+                _current_chat_name = save_chat(
+                    _session_id,
+                    history,
+                    selected["label"],
+                    chat_name=_current_chat_name,
+                    project_name=_active_project,
+                )
+            except Exception:
+                pass
+
+        # Route based on selected model
+        _reply_t0 = time.time()
+        if selected["mode"] == "claude":
+            claude_model = selected.get("claude_model")
+            print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+            _claude_reply = _run_claude_cli(effective_user, model=claude_model, effort_instruction=effort_instr)
+            print("\n")
+            history.append({"role": "user", "content": effective_user})
+            history.append({"role": "assistant", "content": _claude_reply})
+            _post_reply(_claude_reply, effective_user, elapsed=time.time() - _reply_t0)
+            continue
+
+        def _user_content(text: str) -> Any:
+            if _pending_image:
+                return [
+                    {"type": "image_url", "image_url": {"url": _pending_image["url"]}},
+                    {"type": "text", "text": text},
+                ]
+            return text
+
+        if selected["mode"] == "codex_direct":
+            creds = _get_codex_direct_token()
+            if not creds:
+                print(
+                    f"{C.ERR}Not signed in to OpenAI.{C.RST} Run {C.OK}/codex-login{C.RST} first.\n"
+                )
+                continue
+            codex_access, codex_account_id = creds
+            history.append({"role": "user", "content": _user_content(effective_user)})
+            print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+            try:
+                reply = _stream_wham(codex_access, codex_account_id, history, selected["name"], codex_effort, workspace)
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                print()
+                print(f"{C.ERR}[Codex Direct error]{C.RST} {e}\n")
+                history.pop()
+                continue
+            print("\n")
+            history.append({"role": "assistant", "content": reply})
+            _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
+            continue
+
+        if selected["mode"] == "codex_indirect":
+            indirect_token = _load_codex_indirect_key()
+            if indirect_token:
+                history.append({"role": "user", "content": _user_content(effective_user)})
+                print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+                try:
+                    reply = _stream_wham(indirect_token, None, history, selected["name"], codex_effort, workspace)
+                except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                    print()
+                    print(f"{C.ERR}[Codex Indirect error]{C.RST} {e}\n")
+                    history.pop()
+                    continue
+                print("\n")
+                history.append({"role": "assistant", "content": reply})
+                _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
+            else:
+                print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+                _run_codex_cli(effective_user, model=selected["name"])
+                print("\n")
+            continue
+
+        if selected["mode"] == "ollama":
+            history.append({"role": "user", "content": _user_content(effective_user)})
+            print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+            try:
+                reply = run_turn(
+                    client,
+                    selected.get("ollama_api_key") or _OLLAMA_DEFAULT_API_KEY,
+                    selected["name"],
+                    history,
+                    workspace,
+                    selected["ollama_url"],
+                )
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                print()
+                print(f"{C.ERR}[Ollama error]{C.RST} {e}\n")
+                history.pop()
+                continue
+            print("\n")
+            history.append({"role": "assistant", "content": reply})
+            _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
+            continue
+
+        if selected["mode"] == "custom":
+            custom_cfg = load_custom_endpoint()
+            if not custom_cfg:
+                print(
+                    f"{C.ERR}No custom endpoint configured.{C.RST} Use {C.OK}/custom{C.RST} to set one.\n"
+                )
+                continue
+            history.append({"role": "user", "content": _user_content(effective_user)})
+            print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+            try:
+                reply = run_turn(
+                    client,
+                    custom_cfg["api_key"] or "none",
+                    custom_cfg["model"],
+                    history,
+                    workspace,
+                    custom_cfg["url"],
+                )
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                print()
+                print(f"{C.ERR}[Custom endpoint error]{C.RST} {e}\n")
+                history.pop()
+                continue
+            print("\n")
+            history.append({"role": "assistant", "content": reply})
+            _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
+            continue
+
+        if selected["mode"] == "nvidia_direct":
+            if not nvidia_api_key:
+                print(
+                    f"{C.ERR}NVIDIA direct mode needs an API key.{C.RST} Use {C.OK}/api-key-nvidia{C.RST}\n"
+                )
+                continue
+            active_key = nvidia_api_key
+            active_base_url = NVIDIA_DIRECT_URL
+            active_model = selected["name"]
+        else:  # server mode
+            if not api_key:
+                print(
+                    f"{C.ERR}Set an API key first:{C.RST} {C.OK}/api-key{C.RST} (server)\n"
+                )
+                continue
+            active_key = api_key
+            active_base_url = NVIDIA_BASE_URL
+            active_model = model
+
+        history.append({"role": "user", "content": _user_content(effective_user)})
+        print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
+        try:
+            reply = run_turn(client, active_key, active_model, history, workspace, active_base_url)
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            print()
+            print(f"{C.ERR}[MahanAI connection error]{C.RST} {e}\n")
+            history.pop()
+            continue
+        except APIStatusError as e:
+            print()
+            print(f"{C.ERR}[MahanAI API error]{C.RST} {e}\n")
+            history.pop()
+            continue
+        print("\n")
+        history.append({"role": "assistant", "content": reply})
+        _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
+
+    # ── Session exit summary ──────────────────────────────────────────────────
+    if _session_input_tokens > 0 or _session_output_tokens > 0:
+        _exit_sel = AVAILABLE_MODELS[active_model_idx]
+        _exit_key = _exit_sel.get("claude_model") or _exit_sel.get("name", "")
+        _exit_pr = _MODEL_PRICING.get(_exit_key)
+        _cost_str = f"  ~${_session_cost_usd:.4f} USD  ·" if _exit_pr else ""
+        print(
+            f"\n{C.DIM}Session ended.{_cost_str}  "
+            f"{_session_input_tokens:,} in / {_session_output_tokens:,} out tokens{C.RST}\n"
+        )

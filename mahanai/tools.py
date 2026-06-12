@@ -1,0 +1,1138 @@
+"""Tool definitions and execution for the MahanAI agent."""
+
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+from mahanai import colors as C
+
+_JSON_BAD_BACKSLASH = re.compile(r'\\(?!["\\/bfnrtu]|u[0-9a-fA-F]{4})')
+
+# ── Autonomous mode ───────────────────────────────────────────────────────────
+_AUTONOMOUS_MODE: bool = False
+
+
+def set_autonomous_mode(enabled: bool) -> None:
+    global _AUTONOMOUS_MODE
+    _AUTONOMOUS_MODE = enabled
+
+
+def is_autonomous_mode() -> bool:
+    return _AUTONOMOUS_MODE
+
+
+def repair_invalid_json_escapes(raw: str) -> str:
+    s = raw
+    for _ in range(128):
+        try:
+            json.loads(s)
+            return s
+        except json.JSONDecodeError:
+            nxt = _JSON_BAD_BACKSLASH.sub(r"\\\\", s)
+            if nxt == s:
+                return s
+            s = nxt
+    return s
+
+
+def normalize_tool_arguments_json(arguments: str) -> str:
+    """Parse model tool arguments and re-serialize as valid JSON for the API and executor."""
+    raw = (arguments or "").strip() or "{}"
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            obj = json.loads(repair_invalid_json_escapes(raw))
+        except json.JSONDecodeError:
+            return "{}"
+    if not isinstance(obj, dict):
+        return "{}"
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _interact_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "interact",
+            "description": (
+                "Use the local computer by taking screenshots and controlling mouse and keyboard. "
+                "Supported actions: screenshot, move_mouse, click, double_click, right_click, drag, "
+                "scroll, type_text, press_key, hotkey, sleep."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action to perform.",
+                    },
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "button": {"type": "string"},
+                    "text": {"type": "string"},
+                    "key": {"type": "string"},
+                    "keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "dx": {"type": "integer"},
+                    "dy": {"type": "integer"},
+                    "clicks": {"type": "integer"},
+                    "seconds": {"type": "number"},
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
+
+def get_tools() -> list[dict[str, Any]]:
+    from mahanai.config import load_interact_enabled
+
+    tools = list(TOOLS)
+    if load_interact_enabled():
+        tools.append(_interact_tool())
+    return tools
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Execute a shell command now (the user sees ⚡Running: in the terminal). "
+                "Do not only show commands in chat—this tool must be called to run them. "
+                "On Windows the default shell is usually cmd.exe (COMSPEC), not PowerShell; "
+                "use cmd syntax or call powershell -NoProfile -Command \"...\" explicitly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Full command line to execute.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory (absolute or relative to cwd).",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Max seconds to wait (default 120).",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the full text of a file (UTF-8).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a file with UTF-8 text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file contents.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and subdirectories in a path (non-recursive).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path (default: current working directory).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": "Append UTF-8 text to a file (creates the file if missing).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch the text content of a URL (HTML is stripped to plain text).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "python_repl",
+            "description": "Execute Python code in an isolated subprocess and return stdout/stderr.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to execute.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Max seconds to wait (default 30).",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Apply a targeted string replacement to an existing file. "
+                "Reads the file, finds old_string (must appear exactly once), replaces it with new_string, "
+                "shows a diff, then saves. Fails if old_string is not found or appears more than once. "
+                "Prefer this over write_file for surgical, line-level edits."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to find and replace (must be unique in the file).",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Text to replace old_string with.",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web using DuckDuckGo. Returns titles, URLs, and snippets for top results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max results to return (default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+# ── Approval helpers ───────────────────────────────────────────────────────────
+
+_HIGH_RISK_PATTERNS = [
+    re.compile(r"\brm\s+.*(-\s*rf\b|-\s*fr\b|--no-preserve-root)"),
+    re.compile(r"\brmdir(\.exe)?\b.*\s/s\b"),
+    re.compile(r"\brd(\.exe)?\b.*\s/s\b"),
+    re.compile(r"\bdel(\.exe)?\b.*\s/s\b"),
+    re.compile(r"\berase(\.exe)?\b.*\s/s\b"),
+    re.compile(r"\bformat\s+"),
+    re.compile(r"\bshutdown\b"),
+    re.compile(r"\breboot\b"),
+    re.compile(r"\blogoff\b"),
+    re.compile(r"\bhalt\b"),
+    re.compile(r"\bpoweroff\b"),
+    re.compile(r"\binit\s+0\b"),
+    re.compile(r"\bdiskpart\b"),
+    re.compile(r"\bmkfs"),
+    re.compile(r"\bdd\s+if="),
+    re.compile(r":\(\)\s*\{\s*:"),
+    re.compile(r"remove-item.*-recurse.*-force"),
+]
+
+
+def _is_high_risk(cmd: str) -> bool:
+    low = cmd.strip().lower()
+    return any(p.search(low) for p in _HIGH_RISK_PATTERNS)
+
+
+def _command_category(cmd: str) -> str:
+    first = cmd.strip().split()[0].lower().rstrip(".exe") if cmd.strip() else ""
+    if first == "git":
+        return "git"
+    if first == "gh":
+        return "github"
+    return "normal"
+
+
+def _command_prefix(cmd: str) -> str:
+    return cmd.strip().split()[0].lower() if cmd.strip() else ""
+
+
+def _read_input(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def _approve_command(cmd: str) -> tuple[bool, str]:
+    """
+    Show an approval prompt for a shell command.
+    Returns (approved, denial_message_for_ai).
+    """
+    from mahanai.config import load_always_allowed, add_always_allowed_command, load_interact_enabled
+
+    if load_interact_enabled():
+        lowered = cmd.lower()
+        browser_like = any(
+            token in lowered
+            for token in (
+                "chrome.exe",
+                "chrome ",
+                "msedge",
+                "firefox",
+                "start \"\"",
+                "start chrome",
+                "start msedge",
+                "start firefox",
+                "https://",
+                "http://",
+                "www.",
+                "where chrome",
+                "which chrome",
+            )
+        )
+        if browser_like:
+            return False, "Interact is enabled. Use the interact tool for browser/app opening and GUI actions."
+
+    category = _command_category(cmd)
+    prefix = _command_prefix(cmd)
+    high_risk = _is_high_risk(cmd)
+
+    # Autonomous mode: auto-approve non-destructive commands
+    if _AUTONOMOUS_MODE and not high_risk:
+        print(f"\n{C.DIM}  [AUTO] {cmd}{C.RST}", flush=True)
+        return True, ""
+
+    # Always-Allow only applies to normal (non-git, non-gh) commands
+    if category == "normal" and not high_risk:
+        always = load_always_allowed()
+        if prefix in always.get("command_prefixes", []):
+            return True, ""
+
+    # ── Build prompt ──────────────────────────────────────────────────────────
+    cat_label = {
+        "git":    "Git Command",
+        "github": "GitHub Command",
+        "normal": "Shell Command",
+    }[category]
+
+    risk_tag = f"  {C.ERR}[DESTRUCTIVE]{C.RST}" if high_risk else ""
+    print(f"\n{C.WARN}  {cat_label}{C.RST}{risk_tag}")
+    print(f"  {C.DIM}{cmd}{C.RST}")
+
+    if category in ("git", "github"):
+        print(f"  {C.OK}[A]{C.RST} Allow    {C.ERR}[D]{C.RST} Deny")
+        ans = _read_input("  > ")
+        approved = ans.lower() in ("a", "allow")
+    else:
+        # Normal: Allow / Always Allow / Deny
+        always_label = f"Always Allow ({prefix})" if not high_risk else "Always Allow (disabled for destructive)"
+        if high_risk:
+            print(f"  {C.OK}[A]{C.RST} Allow    {C.ERR}[D]{C.RST} Deny")
+            ans = _read_input("  > ")
+            approved = ans.lower() in ("a", "allow")
+        else:
+            print(f"  {C.OK}[A]{C.RST} Allow    {C.DIM}[W] {always_label}{C.RST}    {C.ERR}[D]{C.RST} Deny")
+            ans = _read_input("  > ").lower()
+            if ans in ("w", "always allow", "always"):
+                add_always_allowed_command(prefix)
+                print(f"  {C.OK}'{prefix}' commands will always be allowed.{C.RST}")
+                return True, ""
+            approved = ans in ("a", "allow")
+
+    if approved:
+        return True, ""
+
+    # Denied — let user send a message to the AI
+    msg = _read_input(f"  {C.DIM}Instruction for AI (Enter to skip):{C.RST} ")
+    return False, msg or "Command was denied by the user."
+
+
+def _approve_file_op(op: str, display_path: str) -> tuple[bool, str]:
+    """
+    Show an approval prompt for a file operation.
+    Returns (approved, denial_message_for_ai).
+    """
+    from mahanai.config import load_always_allowed, add_always_allowed_file_op
+
+    if _AUTONOMOUS_MODE:
+        print(f"\n{C.DIM}  [AUTO] {op}: {display_path}{C.RST}", flush=True)
+        return True, ""
+
+    always = load_always_allowed()
+    if op in always.get("file_ops", []):
+        return True, ""
+
+    op_labels = {
+        "read_file":      "Read File",
+        "write_file":     "Write / Create File",
+        "append_file":    "Append to File",
+        "list_directory": "List Directory",
+    }
+    label = op_labels.get(op, op)
+
+    print(f"\n{C.WARN}  {label}{C.RST}")
+    print(f"  {C.DIM}{display_path}{C.RST}")
+    print(f"  {C.OK}[A]{C.RST} Allow    {C.DIM}[W] Always Allow ({label}){C.RST}    {C.ERR}[D]{C.RST} Deny")
+
+    ans = _read_input("  > ").lower()
+
+    if ans in ("w", "always allow", "always"):
+        add_always_allowed_file_op(op)
+        print(f"  {C.OK}'{label}' will always be allowed.{C.RST}")
+        return True, ""
+
+    if ans in ("a", "allow"):
+        return True, ""
+
+    msg = _read_input(f"  {C.DIM}Instruction for AI (Enter to skip):{C.RST} ")
+    return False, msg or "File operation was denied by the user."
+
+
+def _approve_interact(action: str) -> tuple[bool, str]:
+    from mahanai.config import load_interact_always_allow, save_interact_always_allow
+
+    if load_interact_always_allow():
+        return True, ""
+
+    print(f"\n{C.WARN}  Interact Action{C.RST}")
+    print(f"  {C.DIM}{action}{C.RST}")
+    print(f"  {C.OK}[A]{C.RST} Allow    {C.DIM}[W] Always Allow Interact{C.RST}    {C.ERR}[D]{C.RST} Deny")
+    ans = _read_input("  > ").lower()
+    if ans in ("w", "always allow", "always"):
+        save_interact_always_allow(True)
+        print(f"  {C.OK}Interact will always be allowed.{C.RST}")
+        return True, ""
+    if ans in ("a", "allow"):
+        return True, ""
+    msg = _read_input(f"  {C.DIM}Instruction for AI (Enter to skip):{C.RST} ")
+    return False, msg or "Interact was denied by the user."
+
+
+# ── Tool implementations ───────────────────────────────────────────────────────
+
+def _resolve_path(base: Path, raw: str) -> Path:
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (base / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def run_command(base: Path, args: dict[str, object]) -> str:
+    cmd = str(args.get("command", "")).strip()
+    if not cmd:
+        return json.dumps({"error": "empty command"})
+    cwd_raw = args.get("cwd")
+    timeout = int(args.get("timeout_seconds") or 120)
+    cwd = base
+    if isinstance(cwd_raw, str) and cwd_raw.strip():
+        cwd = _resolve_path(base, cwd_raw)
+
+    approved, denial_msg = _approve_command(cmd)
+    if not approved:
+        return json.dumps({
+            "exit_code": -1,
+            "error": "user_denied",
+            "message": denial_msg,
+            "command": cmd,
+            "output": denial_msg,
+            "cwd": str(cwd),
+        })
+
+    print(f"\n{C.OK}⚡Running:{C.RST} {cmd}", flush=True)
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout),
+            env=os.environ.copy(),
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if len(out) > 100_000:
+            out = out[:100_000] + "\n… [truncated]"
+        return json.dumps({"exit_code": proc.returncode, "output": out, "cwd": str(cwd)})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": f"timed out after {timeout}s", "command": cmd})
+    except OSError as e:
+        return json.dumps({"error": str(e), "command": cmd})
+
+
+def read_file(base: Path, args: dict[str, object]) -> str:
+    raw_path = str(args.get("path", ""))
+    path = _resolve_path(base, raw_path)
+
+    approved, denial_msg = _approve_file_op("read_file", str(path))
+    if not approved:
+        return json.dumps({"error": "user_denied", "message": denial_msg, "path": str(path)})
+
+    if not path.is_file():
+        return json.dumps({"error": "not a file", "path": str(path)})
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if len(text) > 200_000:
+            text = text[:200_000] + "\n… [truncated]"
+        return json.dumps({"path": str(path), "content": text})
+    except OSError as e:
+        return json.dumps({"error": str(e), "path": str(path)})
+
+
+def _show_write_diff(path: Path, new_content: str) -> None:
+    """Print a colored unified diff when overwriting an existing file."""
+    if not path.is_file():
+        return
+    try:
+        old_content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if old_content == new_content:
+        print(f"  {C.DIM}(no changes){C.RST}")
+        return
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{path.name}", tofile=f"b/{path.name}", n=3,
+    ))
+    if not diff:
+        return
+    print(f"\n{C.DIM}  Diff ({path.name}):{C.RST}")
+    shown = 0
+    for line in diff:
+        stripped = line.rstrip("\n")
+        if stripped.startswith("+++") or stripped.startswith("---"):
+            print(f"  {C.DIM}{stripped}{C.RST}")
+        elif stripped.startswith("+"):
+            print(f"  \033[32m{stripped}\033[0m")
+        elif stripped.startswith("-"):
+            print(f"  \033[31m{stripped}\033[0m")
+        elif stripped.startswith("@@"):
+            print(f"  {C.WARN}{stripped}{C.RST}")
+        else:
+            print(f"  {C.DIM}{stripped}{C.RST}")
+        shown += 1
+        if shown >= 60:
+            remaining = len(diff) - shown
+            if remaining > 0:
+                print(f"  {C.DIM}… {remaining} more lines not shown{C.RST}")
+            break
+    print()
+
+
+def write_file(base: Path, args: dict[str, object]) -> str:
+    raw_path = str(args.get("path", ""))
+    path = _resolve_path(base, raw_path)
+    content = str(args.get("content", ""))
+
+    _show_write_diff(path, content)
+    approved, denial_msg = _approve_file_op("write_file", str(path))
+    if not approved:
+        return json.dumps({"error": "user_denied", "message": denial_msg, "path": str(path)})
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return json.dumps({"ok": True, "path": str(path), "bytes": len(content.encode("utf-8"))})
+    except OSError as e:
+        return json.dumps({"error": str(e), "path": str(path)})
+
+
+def append_file(base: Path, args: dict[str, object]) -> str:
+    raw_path = str(args.get("path", ""))
+    path = _resolve_path(base, raw_path)
+    content = str(args.get("content", ""))
+
+    approved, denial_msg = _approve_file_op("append_file", str(path))
+    if not approved:
+        return json.dumps({"error": "user_denied", "message": denial_msg, "path": str(path)})
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(content)
+        return json.dumps({"ok": True, "path": str(path), "appended_bytes": len(content.encode("utf-8"))})
+    except OSError as e:
+        return json.dumps({"error": str(e), "path": str(path)})
+
+
+def list_directory(base: Path, args: dict[str, object]) -> str:
+    raw = args.get("path")
+    path = base if not isinstance(raw, str) or not raw.strip() else _resolve_path(base, raw)
+
+    approved, denial_msg = _approve_file_op("list_directory", str(path))
+    if not approved:
+        return json.dumps({"error": "user_denied", "message": denial_msg, "path": str(path)})
+
+    if not path.is_dir():
+        return json.dumps({"error": "not a directory", "path": str(path)})
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        truncated = len(entries) > 500
+        rows = [
+            {"name": p.name, "type": "dir" if p.is_dir() else "file"}
+            for p in entries[:500]
+        ]
+        return json.dumps({"path": str(path), "entries": rows, "truncated": truncated})
+    except OSError as e:
+        return json.dumps({"error": str(e), "path": str(path)})
+
+
+def fetch_url(base: Path, args: dict[str, object]) -> str:
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return json.dumps({"error": "empty url"})
+
+    print(f"\n{C.WARN}  Fetch URL{C.RST}")
+    print(f"  {C.DIM}{url}{C.RST}")
+    print(f"  {C.OK}[A]{C.RST} Allow    {C.ERR}[D]{C.RST} Deny")
+    ans = _read_input("  > ").lower()
+    if ans not in ("a", "allow"):
+        return json.dumps({"error": "user_denied", "url": url})
+
+    try:
+        import httpx as _httpx
+        from html.parser import HTMLParser as _HP
+
+        resp = _httpx.get(url, timeout=30.0, follow_redirects=True)
+        resp.raise_for_status()
+        ct = resp.headers.get("content-type", "")
+        if "html" in ct.lower():
+            class _Stripper(_HP):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.parts: list[str] = []
+                    self._skip = False
+                def handle_starttag(self, tag: str, attrs: object) -> None:
+                    if tag in ("script", "style"):
+                        self._skip = True
+                def handle_endtag(self, tag: str) -> None:
+                    if tag in ("script", "style"):
+                        self._skip = False
+                def handle_data(self, d: str) -> None:
+                    if not self._skip:
+                        self.parts.append(d)
+            s = _Stripper()
+            s.feed(resp.text)
+            text = re.sub(r"\s+", " ", " ".join(s.parts)).strip()
+        else:
+            text = resp.text
+        if len(text) > 50_000:
+            text = text[:50_000] + "\n… [truncated]"
+        return json.dumps({"url": url, "content": text, "status": resp.status_code})
+    except Exception as e:
+        return json.dumps({"error": str(e), "url": url})
+
+
+def python_repl(base: Path, args: dict[str, object]) -> str:
+    code = str(args.get("code", "")).strip()
+    if not code:
+        return json.dumps({"error": "empty code"})
+    timeout = int(args.get("timeout_seconds") or 30)
+
+    print(f"\n{C.WARN}  Python REPL{C.RST}")
+    lines = code.split("\n")
+    preview = "\n  ".join(lines[:5])
+    if len(lines) > 5:
+        preview += f"\n  … ({len(lines)} lines total)"
+    print(f"  {C.DIM}{preview}{C.RST}")
+    print(f"  {C.OK}[A]{C.RST} Allow    {C.ERR}[D]{C.RST} Deny")
+    ans = _read_input("  > ").lower()
+    if ans not in ("a", "allow"):
+        return json.dumps({"error": "user_denied"})
+
+    print(f"\n{C.OK}🐍 Running Python...{C.RST}", flush=True)
+    fname: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+            f.write(code)
+            fname = f.name
+        proc = subprocess.run(
+            [sys.executable, fname],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout),
+            env=os.environ.copy(),
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if len(out) > 50_000:
+            out = out[:50_000] + "\n… [truncated]"
+        return json.dumps({"exit_code": proc.returncode, "output": out})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": f"timed out after {timeout}s"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    finally:
+        if fname:
+            try:
+                Path(fname).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def web_search(base: Path, args: dict[str, object]) -> str:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return json.dumps({"error": "empty query"})
+    max_results = int(args.get("max_results") or 5)
+
+    print(f"\n{C.WARN}  Web Search{C.RST}")
+    print(f"  {C.DIM}{query}{C.RST}")
+    print(f"  {C.OK}[A]{C.RST} Allow    {C.ERR}[D]{C.RST} Deny")
+    ans = _read_input("  > ").lower()
+    if ans not in ("a", "allow"):
+        return json.dumps({"error": "user_denied", "query": query})
+
+    try:
+        import urllib.parse
+        import httpx as _httpx
+        from html.parser import HTMLParser as _HP
+
+        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = _httpx.get(url, headers=headers, timeout=15.0, follow_redirects=True)
+        resp.raise_for_status()
+
+        class _DDGParser(_HP):
+            def __init__(self) -> None:
+                super().__init__()
+                self._in_title = False
+                self._in_snippet = False
+                self._cur_url: str | None = None
+                self._cur_title: list[str] = []
+                self._cur_snippet: list[str] = []
+                self.results: list[dict] = []
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                d = dict(attrs)
+                cls = d.get("class", "")
+                if tag == "a" and "result__a" in cls:
+                    self._in_title = True
+                    self._cur_title = []
+                    href = d.get("href", "")
+                    if "uddg=" in href:
+                        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                        self._cur_url = parsed.get("uddg", [href])[0]
+                    else:
+                        self._cur_url = href
+                if "result__snippet" in cls:
+                    self._in_snippet = True
+                    self._cur_snippet = []
+
+            def handle_endtag(self, tag: str) -> None:
+                if self._in_title and tag == "a":
+                    self._in_title = False
+                    if self._cur_url and self._cur_title:
+                        if not any(r["url"] == self._cur_url for r in self.results):
+                            self.results.append({
+                                "title": "".join(self._cur_title).strip(),
+                                "url": self._cur_url,
+                                "snippet": "",
+                            })
+                if self._in_snippet and tag in ("a", "div", "span"):
+                    self._in_snippet = False
+                    if self.results:
+                        self.results[-1]["snippet"] = "".join(self._cur_snippet).strip()
+                    self._cur_snippet = []
+
+            def handle_data(self, d: str) -> None:
+                if self._in_title:
+                    self._cur_title.append(d)
+                elif self._in_snippet:
+                    self._cur_snippet.append(d)
+
+        parser = _DDGParser()
+        parser.feed(resp.text)
+        results = parser.results[:max_results]
+        return json.dumps({"query": query, "results": results})
+    except Exception as e:
+        return json.dumps({"error": str(e), "query": query})
+
+
+def interact(base: Path, args: dict[str, object]) -> str:
+    action = str(args.get("action", "")).strip().lower()
+    if not action:
+        return json.dumps({"error": "empty action"})
+
+    try:
+        import pyautogui
+    except Exception as e:
+        return json.dumps({
+            "error": f"pyautogui is not installed or failed to import: {e}",
+        })
+
+    try:
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
+    except Exception:
+        pass
+
+    approved, denial_msg = _approve_interact(action)
+    if not approved:
+        return json.dumps({"error": "user_denied", "message": denial_msg, "action": action})
+
+    def _shot() -> dict[str, Any]:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = base / f".mahanai-interact-{ts}.png"
+        img = pyautogui.screenshot()
+        img.save(path)
+        return {
+            "ok": True,
+            "path": str(path),
+            "size": [img.size[0], img.size[1]],
+        }
+
+    try:
+        if action == "screenshot":
+            return json.dumps(_shot())
+        if action == "move_mouse":
+            pyautogui.moveTo(int(args.get("x", 0)), int(args.get("y", 0)), duration=0.15)
+            return json.dumps({"ok": True, "action": action})
+        if action == "click":
+            pyautogui.click(
+                x=args.get("x"),
+                y=args.get("y"),
+                clicks=int(args.get("clicks") or 1),
+                button=str(args.get("button") or "left"),
+            )
+            return json.dumps({"ok": True, "action": action})
+        if action == "double_click":
+            pyautogui.doubleClick(x=args.get("x"), y=args.get("y"), button=str(args.get("button") or "left"))
+            return json.dumps({"ok": True, "action": action})
+        if action == "right_click":
+            pyautogui.rightClick(x=args.get("x"), y=args.get("y"))
+            return json.dumps({"ok": True, "action": action})
+        if action == "drag":
+            pyautogui.dragTo(int(args.get("x", 0)), int(args.get("y", 0)), duration=0.3, button=str(args.get("button") or "left"))
+            return json.dumps({"ok": True, "action": action})
+        if action == "scroll":
+            pyautogui.scroll(int(args.get("dy") or 0))
+            return json.dumps({"ok": True, "action": action})
+        if action == "type_text":
+            pyautogui.write(str(args.get("text", "")), interval=0.01)
+            return json.dumps({"ok": True, "action": action})
+        if action == "press_key":
+            pyautogui.press(str(args.get("key", "")))
+            return json.dumps({"ok": True, "action": action})
+        if action == "hotkey":
+            keys = args.get("keys") or []
+            if not isinstance(keys, list) or not keys:
+                return json.dumps({"error": "keys must be a non-empty array"})
+            pyautogui.hotkey(*[str(k) for k in keys])
+            return json.dumps({"ok": True, "action": action, "keys": [str(k) for k in keys]})
+        if action == "sleep":
+            time.sleep(max(0.0, float(args.get("seconds") or 0.0)))
+            return json.dumps({"ok": True, "action": action})
+        return json.dumps({"error": f"unknown interact action: {action}"})
+    except Exception as e:
+        return json.dumps({"error": str(e), "action": action})
+
+
+def edit_file(base: Path, args: dict[str, object]) -> str:
+    raw_path = str(args.get("path", ""))
+    path = _resolve_path(base, raw_path)
+    old_string = str(args.get("old_string", ""))
+    new_string = str(args.get("new_string", ""))
+
+    if not old_string:
+        return json.dumps({"error": "old_string must not be empty"})
+    if not path.is_file():
+        return json.dumps({"error": "not a file", "path": str(path)})
+
+    try:
+        original = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return json.dumps({"error": str(e), "path": str(path)})
+
+    count = original.count(old_string)
+    if count == 0:
+        return json.dumps({"error": "old_string not found in file", "path": str(path)})
+    if count > 1:
+        return json.dumps({
+            "error": f"old_string appears {count} times — add more surrounding context to make it unique",
+            "path": str(path),
+        })
+
+    new_content = original.replace(old_string, new_string, 1)
+    _show_write_diff(path, new_content)
+
+    approved, denial_msg = _approve_file_op("write_file", str(path))
+    if not approved:
+        return json.dumps({"error": "user_denied", "message": denial_msg, "path": str(path)})
+
+    try:
+        path.write_text(new_content, encoding="utf-8")
+        return json.dumps({"ok": True, "path": str(path)})
+    except OSError as e:
+        return json.dumps({"error": str(e), "path": str(path)})
+
+
+def batch_approve_and_execute(
+    calls: list[tuple[str, str, str]],  # [(call_id, name, arguments_json), ...]
+    workspace: Path,
+) -> dict[str, str]:
+    """
+    Batch-approve and (where safe) execute tools in parallel.
+    Shows all pending tools, asks for batch approval, then runs them.
+    Returns {call_id: result_json}.
+    """
+    import concurrent.futures
+
+    if not calls:
+        return {}
+
+    if len(calls) == 1:
+        cid, name, args_json = calls[0]
+        return {cid: execute_tool(name, args_json, workspace)}
+
+    # Show all pending tools
+    print(f"\n{C.WARN}  {len(calls)} tools requested:{C.RST}")
+    for i, (cid, name, args_json) in enumerate(calls, 1):
+        try:
+            args = json.loads(normalize_tool_arguments_json(args_json))
+        except Exception:
+            args = {}
+        # Build a short display of the args
+        if name == "run_command":
+            detail = args.get("command", "")[:80]
+        elif name in ("read_file", "write_file", "append_file", "edit_file"):
+            detail = args.get("path", "")
+        elif name == "web_search":
+            detail = args.get("query", "")[:60]
+        elif name == "fetch_url":
+            detail = args.get("url", "")[:60]
+        elif name == "interact":
+            detail = args.get("action", "")
+        else:
+            detail = str(args)[:60]
+        print(f"  {C.DIM}{i}. {name}{C.RST}  {C.DIM}{detail}{C.RST}")
+
+    print(f"  {C.OK}[A]{C.RST} Approve all  {C.DIM}[R]{C.RST} Review each  {C.ERR}[D]{C.RST} Deny all")
+    ans = _read_input("  > ").strip().lower()
+
+    results: dict[str, str] = {}
+
+    if ans in ("d", "deny"):
+        for cid, name, _ in calls:
+            results[cid] = json.dumps({"error": "user_denied", "message": "Denied by user."})
+        return results
+
+    from mahanai.config import load_interact_always_allow
+    if all(name == "interact" for _, name, _ in calls) and load_interact_always_allow():
+        ans = "a"
+
+    if ans in ("r", "review"):
+        for cid, name, args_json in calls:
+            results[cid] = execute_tool(name, args_json, workspace)
+        return results
+
+    # Approve all — execute in parallel
+    print(f"  {C.OK}Running {len(calls)} tools in parallel...{C.RST}")
+
+    def _run_one(call: tuple[str, str, str]) -> tuple[str, str]:
+        cid, name, args_json = call
+        canon = normalize_tool_arguments_json(args_json)
+        try:
+            args = json.loads(canon)
+        except json.JSONDecodeError:
+            return cid, json.dumps({"error": "invalid JSON arguments"})
+        # Execute without interactive approval (already batch-approved above)
+        if name == "run_command":
+            cmd = str(args.get("command", "")).strip()
+            cwd_raw = args.get("cwd")
+            timeout = int(args.get("timeout_seconds") or 120)
+            cwd = workspace
+            if isinstance(cwd_raw, str) and cwd_raw.strip():
+                cwd = _resolve_path(workspace, cwd_raw)
+            print(f"\n{C.OK}⚡Running:{C.RST} {cmd}", flush=True)
+            try:
+                proc = subprocess.run(
+                    cmd, shell=True, cwd=str(cwd),
+                    capture_output=True, text=True,
+                    timeout=max(1, timeout), env=os.environ.copy(),
+                )
+                out = (proc.stdout or "") + (proc.stderr or "")
+                if len(out) > 100_000:
+                    out = out[:100_000] + "\n… [truncated]"
+                return cid, json.dumps({"exit_code": proc.returncode, "output": out, "cwd": str(cwd)})
+            except subprocess.TimeoutExpired:
+                return cid, json.dumps({"error": f"timed out after {timeout}s", "command": cmd})
+            except OSError as e:
+                return cid, json.dumps({"error": str(e), "command": cmd})
+        elif name == "read_file":
+            path = _resolve_path(workspace, str(args.get("path", "")))
+            if not path.is_file():
+                return cid, json.dumps({"error": "not a file", "path": str(path)})
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                if len(text) > 200_000:
+                    text = text[:200_000] + "\n… [truncated]"
+                return cid, json.dumps({"path": str(path), "content": text})
+            except OSError as e:
+                return cid, json.dumps({"error": str(e)})
+        elif name == "list_directory":
+            raw = args.get("path")
+            path = workspace if not isinstance(raw, str) or not raw.strip() else _resolve_path(workspace, raw)
+            if not path.is_dir():
+                return cid, json.dumps({"error": "not a directory", "path": str(path)})
+            try:
+                entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                rows = [{"name": p.name, "type": "dir" if p.is_dir() else "file"} for p in entries[:500]]
+                return cid, json.dumps({"path": str(path), "entries": rows})
+            except OSError as e:
+                return cid, json.dumps({"error": str(e)})
+        else:
+            # Fallback: sequential with standard approval
+            return cid, execute_tool(name, args_json, workspace)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(calls), 8)) as executor:
+        futures = [executor.submit(_run_one, call) for call in calls]
+        for f in concurrent.futures.as_completed(futures):
+            cid, result = f.result()
+            results[cid] = result
+
+    return results
+
+
+def execute_tool(name: str, arguments_json: str, workspace: Path) -> str:
+    canon = normalize_tool_arguments_json(arguments_json)
+    if canon == "{}" and (arguments_json or "").strip() not in ("", "{}"):
+        return json.dumps(
+            {
+                "error": "could not parse tool arguments as JSON",
+                "raw": (arguments_json or "")[:500],
+            }
+        )
+    try:
+        args = json.loads(canon)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"invalid JSON arguments: {e}"})
+
+    if name == "run_command":
+        result = run_command(workspace, args)
+    elif name == "read_file":
+        result = read_file(workspace, args)
+    elif name == "write_file":
+        result = write_file(workspace, args)
+    elif name == "append_file":
+        result = append_file(workspace, args)
+    elif name == "list_directory":
+        result = list_directory(workspace, args)
+    elif name == "fetch_url":
+        result = fetch_url(workspace, args)
+    elif name == "python_repl":
+        result = python_repl(workspace, args)
+    elif name == "edit_file":
+        result = edit_file(workspace, args)
+    elif name == "web_search":
+        result = web_search(workspace, args)
+    elif name == "interact":
+        result = interact(workspace, args)
+    else:
+        return json.dumps({"error": f"unknown tool: {name}"})
+
+    try:
+        from mahanai.config import audit_log_path
+        import datetime as _dt
+        _log = audit_log_path()
+        _log.parent.mkdir(parents=True, exist_ok=True)
+        _ts = _dt.datetime.now().isoformat(timespec="seconds")
+        _ap = (arguments_json or "")[:120].replace("\n", " ")
+        _rp = (result or "")[:120].replace("\n", " ")
+        with _log.open("a", encoding="utf-8") as _f:
+            _f.write(f"{_ts} | {name} | {_ap} | {_rp}\n")
+    except Exception:
+        pass
+
+    return result
