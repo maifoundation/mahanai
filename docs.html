@@ -401,6 +401,13 @@ $ mahanai</code></div>
           <li>Choosing a theme (midnight, light, or colorblind-friendly)</li>
         </ul>
 
+        <h2 class="doc-h2">Guided Bootstrap (Optional)</h2>
+        <p class="doc-p">For a fully automated setup that installs Python via uv, then MahanAI:</p>
+        <div class="code-block"><code>$ ./scripts/get-started.sh         # Linux/macOS
+$ .\scripts\get-started.ps1        # Windows (PowerShell)
+$ pwsh .\scripts\get-started.ps1   # Windows (PowerShell Core)</code></div>
+        <p class="doc-p">On macOS, you can also double-click <code>scripts/get-started.command</code> from Finder.</p>
+
         <h2 class="doc-h2">Your First Chat</h2>
         <p class="doc-p">Once launched, you'll see a full-width chat loop with:</p>
         <ul class="doc-ul">
@@ -584,6 +591,16 @@ $ /mode my-model     # switch to it</code></div>
         <div class="cmd-ref">
           <div class="cmd">/shell-history inject</div>
           <div class="desc">Add recent bash/zsh history to context.</div>
+        </div>
+
+        <h2 class="doc-h2">Computer Control</h2>
+        <div class="cmd-ref">
+          <div class="cmd">/interact</div>
+          <div class="desc">Enable computer control with screenshots, mouse, and keyboard.</div>
+        </div>
+        <div class="cmd-ref">
+          <div class="cmd">/interact remove</div>
+          <div class="desc">Disable computer control and remove the feature.</div>
         </div>
 
         <h2 class="doc-h2">Themes & Display</h2>

@@ -803,6 +803,16 @@
       </div>
 
       <div class="card w2">
+        <div class="ico"><i data-lucide="monitor"></i></div>
+        <h3>Interact mode.</h3>
+        <p>
+          <code>/interact</code> lets MahanAI control your computer
+          with screenshots, mouse, and keyboard. Remove anytime with
+          <code>/interact remove</code>.
+        </p>
+      </div>
+
+      <div class="card w2">
         <div class="ico"><i data-lucide="bell"></i></div>
         <h3>Desktop notifications.</h3>
         <p>
@@ -813,7 +823,7 @@
 
       <div class="card w2">
         <div class="ico"><i data-lucide="terminal"></i></div>
-        <h3>Shell history.</h3>
+        <h3>Shell history awareness.</h3>
         <p>
           <code>/shell-history inject</code> adds recent bash/zsh history
           to context. Code suggestions know your workflow.
@@ -938,9 +948,9 @@
       <div class="gw-col">
         <h4>Backends</h4>
         <div class="gw-item"><span class="dot p"></span>Anthropic · claude-*</div>
-        <div class="gw-item"><span class="dot g"></span>OpenAI Codex · gpt-5.*</div>
         <div class="gw-item"><span class="dot c"></span>NVIDIA NIM · llama-3.3</div>
-        <div class="gw-item"><span class="dot y"></span>Mahan NIM · mahanai</div>
+        <div class="gw-item"><span class="dot g"></span>OpenAI · gpt-5.*</div>
+        <div class="gw-item"><span class="dot y"></span>Ollama · any local model</div>
         <div class="gw-item"><span class="dot b"></span>Custom · any /v1</div>
       </div>
     </div>
@@ -1082,6 +1092,10 @@
         <span class="desc">Add recent bash/zsh history to context.</span>
       </div>
       <div class="cmd-row">
+        <span class="cmd">/interact · /interact remove</span>
+        <span class="desc">Enable or disable computer control with screenshots, mouse, and keyboard.</span>
+      </div>
+      <div class="cmd-row">
         <span class="cmd">/approvals · /approvals clear</span>
         <span class="desc">List or wipe all <b>Always Allow</b> rules.</span>
       </div>
@@ -1143,7 +1157,11 @@
       </div>
     </div>
 
-    <div style="margin-top: 32px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;" class="install-detail-grid">
+    <div style="margin-top: 32px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;" class="install-detail-grid">
+      <div class="card" style="padding: 22px;">
+        <h3 style="font-size: 16px; margin-bottom: 10px;">Guided bootstrap</h3>
+        <p style="font-size: 13.5px;">Run <code>./scripts/get-started.sh</code> (Linux/macOS) or <code>.\scripts\get-started.ps1</code> (Windows) to auto-install Python via uv, then MahanAI.</p>
+      </div>
       <div class="card" style="padding: 22px;">
         <h3 style="font-size: 16px; margin-bottom: 10px;">Onboarding wizard</h3>
         <p style="font-size: 13.5px;">Pick a model, set API keys, choose theme on first run.</p>
