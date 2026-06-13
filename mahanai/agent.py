@@ -36,6 +36,7 @@ from mahanai.config import (
     load_always_allowed,
     load_codex_token,
     load_custom_endpoint,
+    load_default_model,
     load_nvidia_api_key,
     load_ollama_providers,
     load_plugins,
@@ -52,6 +53,7 @@ from mahanai.config import (
     save_api_key,
     save_codex_token,
     save_custom_endpoint,
+    save_default_model,
     save_nvidia_api_key,
     save_ollama_provider,
     save_plugin,
@@ -607,6 +609,11 @@ def _set_vim_mode(enabled: bool) -> bool:
         return False
 
 
+def _model_index_for_name(model_name: str) -> int | None:
+    """Return the index of a model entry by model id, or None if unknown."""
+    return next((i for i, m in enumerate(AVAILABLE_MODELS) if m["name"] == model_name), None)
+
+
 def _run_onboarding_wizard() -> None:
     """First-run interactive setup wizard."""
     print(f"\n{C.OK}Welcome to MahanAI Max 2.0!{C.RST}")
@@ -620,13 +627,17 @@ def _run_onboarding_wizard() -> None:
     choice = input(f"  {C.DIM}Choice [1]: {C.RST}").strip() or "1"
 
     if choice == "3":
+        save_default_model("meta/llama-3.3-70b-instruct")
         key = input(f"  {C.DIM}NVIDIA API key (leave blank to skip): {C.RST}").strip()
         if key:
             from mahanai.config import save_nvidia_api_key
             save_nvidia_api_key(key)
             print(f"  {C.OK}NVIDIA key saved.{C.RST}")
     elif choice in ("1", "2"):
+        save_default_model("claude-haiku-4-5-20251001" if choice == "1" else "claude-sonnet-4-6")
         print(f"  {C.DIM}Claude CLI mode selected. Make sure 'claude' is on your PATH.{C.RST}")
+    else:
+        save_default_model(DEFAULT_MODEL)
 
     print(f"\n{C.OK}5 commands to know:{C.RST}")
     print(f"  {C.OK}/models{C.RST}   {C.DIM}switch models interactively{C.RST}")
@@ -1876,10 +1887,10 @@ def main() -> None:
 
     history: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
 
-    active_model_idx = next(
-        (i for i, m in enumerate(AVAILABLE_MODELS) if m.get("claude_model") == "claude-haiku-4-5-20251001"),
-        0,
-    )
+    _startup_model_name = load_default_model() or DEFAULT_MODEL
+    active_model_idx = _model_index_for_name(_startup_model_name)
+    if active_model_idx is None:
+        active_model_idx = _model_index_for_name(DEFAULT_MODEL) or 0
     current_effort = "medium"
     plan_mode = False
     show_tokens: bool = load_tokens_setting()
@@ -1928,10 +1939,7 @@ def main() -> None:
     _env_model = os.environ.get("MAHANAI_MODEL", "")
     _env_model_unrecognized = False
     if _env_model:
-        _env_idx = next(
-            (i for i, m in enumerate(AVAILABLE_MODELS) if m["name"] == _env_model),
-            None,
-        )
+        _env_idx = _model_index_for_name(_env_model)
         if _env_idx is not None:
             active_model_idx = _env_idx
         else:
@@ -2064,14 +2072,12 @@ def main() -> None:
             if cmd == "/mode":
                 target = rest.strip().lower()
                 if target == "claude":
-                    active_model_idx = next(
-                        i for i, m in enumerate(AVAILABLE_MODELS) if m.get("claude_model") == "claude-sonnet-4-6"
-                    )
+                    active_model_idx = _model_index_for_name("claude-sonnet-4-6") or active_model_idx
                     print(f"{C.OK}Switched to:{C.RST} {AVAILABLE_MODELS[active_model_idx]['label']}\n")
 
                 elif target in {"default", "server", "mahanai", ""}:
-                    active_model_idx = 1
-                    print(f"{C.OK}Switched to:{C.RST} {AVAILABLE_MODELS[1]['label']}\n")
+                    active_model_idx = _model_index_for_name(load_default_model() or DEFAULT_MODEL) or active_model_idx
+                    print(f"{C.OK}Switched to:{C.RST} {AVAILABLE_MODELS[active_model_idx]['label']}\n")
                 else:
                     print(f"{C.ERR}Unknown mode '{target}'.{C.RST} Use: /mode claude  or  /mode default\n")
                 continue

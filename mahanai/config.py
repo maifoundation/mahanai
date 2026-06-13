@@ -162,6 +162,30 @@ def clear_custom_endpoint() -> None:
             pass
 
 
+def save_default_model(model: str) -> None:
+    data = _read_config()
+    data["default_model"] = model.strip()
+    _write_config(data)
+
+
+def load_default_model() -> str | None:
+    model = (_read_config().get("default_model") or "").strip()
+    return model or None
+
+
+def clear_default_model() -> None:
+    data = _read_config()
+    data.pop("default_model", None)
+    if data:
+        _write_config(data)
+    else:
+        path = config_file_path()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def load_theme() -> str:
     return (_read_config().get("theme") or "midnight")
 

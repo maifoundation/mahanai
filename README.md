@@ -34,6 +34,20 @@ mahanai
 
 That's it. An onboarding wizard runs on first launch to help you pick a model and set up API keys.
 
+If you want a guided bootstrap that installs `uv`, installs Python through `uv`, installs `mahanai`, and launches it, use one of the included get-started scripts:
+
+```bash
+./scripts/get-started.sh
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\get-started.ps1
+```
+
+If you use PowerShell Core, swap `powershell` for `pwsh`.
+
+On macOS, you can also double-click `scripts/get-started.command` from Finder.
+
 ---
 
 ## Highlights
