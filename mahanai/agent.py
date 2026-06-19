@@ -159,13 +159,43 @@ def _send_notification(title: str, body: str) -> None:
         pass
 
 
+def _can_import_pyautogui() -> bool:
+    from mahanai.tools import _can_import_pyautogui as _tools_can_import_pyautogui
+
+    return _tools_can_import_pyautogui()
+
+
+def _wayland_helpers_available() -> bool:
+    from mahanai.tools import _wayland_helpers_available as _tools_wayland_helpers_available
+
+    return _tools_wayland_helpers_available()
+
+
+def _wayland_input_available() -> bool:
+    from mahanai.tools import _wayland_input_available as _tools_wayland_input_available
+
+    return _tools_wayland_input_available()
+
+
+def _x11_fallback_available() -> bool:
+    from mahanai.tools import _x11_fallback_available as _tools_x11_fallback_available
+
+    return _tools_x11_fallback_available()
+
+
 def _ensure_interact_dependencies() -> tuple[bool, str]:
     """Install or verify the computer-control dependencies."""
-    try:
-        import pyautogui  # noqa: F401
-        return True, "Interact is ready."
-    except Exception:
-        pass
+    if _wayland_helpers_available():
+        return True, "Interact is ready with Wayland helpers."
+
+    if _x11_fallback_available() and _can_import_pyautogui():
+        return True, "Interact is ready with the X11 pyautogui fallback."
+
+    if _wayland_input_available():
+        return False, "Wayland screenshot support is present, but ydotool is required for mouse and keyboard input."
+
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland":
+        return False, "Wayland session detected, but ydotool is missing and X11 fallback is unavailable because Xauthority is not usable."
 
     installer = [
         sys.executable,
@@ -185,8 +215,10 @@ def _ensure_interact_dependencies() -> tuple[bool, str]:
 
     try:
         import pyautogui  # noqa: F401
-        return True, "Interact is ready."
+        return True, "Interact is ready with the X11 pyautogui fallback."
     except Exception as e:
+        if _wayland_helpers_available():
+            return True, "Interact is ready with Wayland helpers."
         return False, str(e)
 
 
@@ -1752,7 +1784,7 @@ def _print_help(term: str = "") -> None:
         f"\n"
         f"  /voice on|off               Toggle voice input (requires SpeechRecognition)\n"
         f"  /auto on|off                Autonomous mode — skip approval prompts (destructive cmds still ask)\n"
-        f"  /interact [remove]          Enable or remove computer control\n"
+        f"  /interact [remove]          Enable or remove computer control (Wayland-first, X11 fallback)\n"
         f"  /vim on|off                 Vim keybindings for the prompt (Esc → normal, i → insert)\n"
         f"  /notify [title]             Send a test desktop notification\n"
         f"  /shell-history              Show recent shell history\n"

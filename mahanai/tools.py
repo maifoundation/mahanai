@@ -6,6 +6,7 @@ import difflib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,360 @@ def normalize_tool_arguments_json(arguments: str) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
+def _command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def _can_import_pyautogui() -> bool:
+    try:
+        import pyautogui  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _wayland_helpers_available() -> bool:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if not (os.environ.get("WAYLAND_DISPLAY") or session_type == "wayland"):
+        return False
+    return _command_exists("grim") and _command_exists("ydotool")
+
+
+def _wayland_screenshot_available() -> bool:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if not (os.environ.get("WAYLAND_DISPLAY") or session_type == "wayland"):
+        return False
+    return _command_exists("grim")
+
+
+def _wayland_input_available() -> bool:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if not (os.environ.get("WAYLAND_DISPLAY") or session_type == "wayland"):
+        return False
+    return _command_exists("ydotool")
+
+
+def _x11_fallback_available() -> bool:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display:
+        return False
+    xauthority = os.environ.get("XAUTHORITY", "").strip()
+    if xauthority:
+        return Path(xauthority).expanduser().is_file()
+    return (Path.home() / ".Xauthority").is_file()
+
+
+_WAYLAND_BUTTON_CODES = {
+    "left": "0xC0",
+    "middle": "0xC2",
+    "right": "0xC1",
+}
+
+_WAYLAND_KEY_CODES = {
+    "esc": 1,
+    "escape": 1,
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 7,
+    "7": 8,
+    "8": 9,
+    "9": 10,
+    "0": 11,
+    "backspace": 14,
+    "tab": 15,
+    "q": 16,
+    "w": 17,
+    "e": 18,
+    "r": 19,
+    "t": 20,
+    "y": 21,
+    "u": 22,
+    "i": 23,
+    "o": 24,
+    "p": 25,
+    "enter": 28,
+    "return": 28,
+    "ctrl": 29,
+    "control": 29,
+    "a": 30,
+    "s": 31,
+    "d": 32,
+    "f": 33,
+    "g": 34,
+    "h": 35,
+    "j": 36,
+    "k": 37,
+    "l": 38,
+    "shift": 42,
+    "z": 44,
+    "x": 45,
+    "c": 46,
+    "v": 47,
+    "b": 48,
+    "n": 49,
+    "m": 50,
+    "alt": 56,
+    "space": 57,
+    "capslock": 58,
+    "f1": 59,
+    "f2": 60,
+    "f3": 61,
+    "f4": 62,
+    "f5": 63,
+    "f6": 64,
+    "f7": 65,
+    "f8": 66,
+    "f9": 67,
+    "f10": 68,
+    "numlock": 69,
+    "scrolllock": 70,
+    "f11": 87,
+    "f12": 88,
+    "home": 102,
+    "up": 103,
+    "pageup": 104,
+    "left": 105,
+    "right": 106,
+    "end": 107,
+    "down": 108,
+    "pagedown": 109,
+    "insert": 110,
+    "delete": 111,
+    "super": 125,
+    "meta": 125,
+}
+
+
+def _wayland_key_code(key: str) -> int | None:
+    cleaned = key.strip().lower().replace(" ", "_").replace("-", "_")
+    if len(cleaned) == 1 and cleaned in _WAYLAND_KEY_CODES:
+        return _WAYLAND_KEY_CODES[cleaned]
+    return _WAYLAND_KEY_CODES.get(cleaned)
+
+
+def _wayland_key_sequence(keys: list[str], *, press_and_release: bool = True) -> list[str]:
+    codes: list[int] = []
+    for key in keys:
+        code = _wayland_key_code(str(key))
+        if code is None:
+            raise ValueError(f"unsupported Wayland key: {key}")
+        codes.append(code)
+
+    seq: list[str] = []
+    if press_and_release:
+        for code in codes:
+            seq.append(f"{code}:1")
+        for code in reversed(codes):
+            seq.append(f"{code}:0")
+    else:
+        for code in codes:
+            seq.append(f"{code}:1")
+    return seq
+
+
+def _run_wayland_command(args: list[str], *, timeout: int = 15) -> None:
+    subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=True)
+
+
+class _InteractBackend:
+    kind = "base"
+
+    def __init__(self, base: Path):
+        self.base = base
+
+    def _screenshot_path(self) -> Path:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        return self.base / f".mahanai-interact-{ts}.png"
+
+    def screenshot(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def move_mouse(self, x: int, y: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def click(self, args: dict[str, object]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def double_click(self, args: dict[str, object]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def right_click(self, args: dict[str, object]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def drag(self, args: dict[str, object]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def scroll(self, dy: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def type_text(self, text: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def press_key(self, key: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def hotkey(self, keys: list[str]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def sleep(self, seconds: float) -> dict[str, Any]:
+        time.sleep(max(0.0, float(seconds)))
+        return {"ok": True, "action": "sleep"}
+
+
+class _X11InteractBackend(_InteractBackend):
+    kind = "x11"
+
+    def __init__(self, base: Path):
+        super().__init__(base)
+        self._pyautogui = None
+
+    def _pyautogui_module(self):
+        if self._pyautogui is None:
+            import pyautogui
+
+            self._pyautogui = pyautogui
+            try:
+                self._pyautogui.FAILSAFE = True
+                self._pyautogui.PAUSE = 0.05
+            except Exception:
+                pass
+        return self._pyautogui
+
+    def screenshot(self) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        img = pyautogui.screenshot()
+        path = self._screenshot_path()
+        img.save(path)
+        return {"ok": True, "path": str(path), "size": [img.size[0], img.size[1]]}
+
+    def move_mouse(self, x: int, y: int) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.moveTo(int(x), int(y), duration=0.15)
+        return {"ok": True, "action": "move_mouse"}
+
+    def click(self, args: dict[str, object]) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.click(
+            x=args.get("x"),
+            y=args.get("y"),
+            clicks=int(args.get("clicks") or 1),
+            button=str(args.get("button") or "left"),
+        )
+        return {"ok": True, "action": "click"}
+
+    def double_click(self, args: dict[str, object]) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.doubleClick(x=args.get("x"), y=args.get("y"), button=str(args.get("button") or "left"))
+        return {"ok": True, "action": "double_click"}
+
+    def right_click(self, args: dict[str, object]) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.rightClick(x=args.get("x"), y=args.get("y"))
+        return {"ok": True, "action": "right_click"}
+
+    def drag(self, args: dict[str, object]) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.dragTo(int(args.get("x", 0)), int(args.get("y", 0)), duration=0.3, button=str(args.get("button") or "left"))
+        return {"ok": True, "action": "drag"}
+
+    def scroll(self, dy: int) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.scroll(int(dy))
+        return {"ok": True, "action": "scroll"}
+
+    def type_text(self, text: str) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.write(str(text), interval=0.01)
+        return {"ok": True, "action": "type_text"}
+
+    def press_key(self, key: str) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.press(str(key))
+        return {"ok": True, "action": "press_key"}
+
+    def hotkey(self, keys: list[str]) -> dict[str, Any]:
+        pyautogui = self._pyautogui_module()
+        pyautogui.hotkey(*[str(k) for k in keys])
+        return {"ok": True, "action": "hotkey", "keys": [str(k) for k in keys]}
+
+
+class _WaylandInteractBackend(_InteractBackend):
+    kind = "wayland"
+
+    def screenshot(self) -> dict[str, Any]:
+        path = self._screenshot_path()
+        _run_wayland_command(["grim", str(path)])
+        return {"ok": True, "path": str(path), "size": None}
+
+    def move_mouse(self, x: int, y: int) -> dict[str, Any]:
+        _run_wayland_command(["ydotool", "mousemove", "--absolute", "-x", str(int(x)), "-y", str(int(y))])
+        return {"ok": True, "action": "move_mouse"}
+
+    def click(self, args: dict[str, object]) -> dict[str, Any]:
+        button = str(args.get("button") or "left").strip().lower()
+        clicks = max(1, int(args.get("clicks") or 1))
+        code = _WAYLAND_BUTTON_CODES.get(button, _WAYLAND_BUTTON_CODES["left"])
+        if clicks > 1:
+            _run_wayland_command(["ydotool", "click", "--repeat", str(clicks), "--next-delay", "25", code])
+        else:
+            _run_wayland_command(["ydotool", "click", code])
+        return {"ok": True, "action": "click", "button": button, "clicks": clicks}
+
+    def double_click(self, args: dict[str, object]) -> dict[str, Any]:
+        payload = dict(args)
+        payload["clicks"] = 2
+        return self.click(payload)
+
+    def right_click(self, args: dict[str, object]) -> dict[str, Any]:
+        payload = dict(args)
+        payload["button"] = "right"
+        return self.click(payload)
+
+    def drag(self, args: dict[str, object]) -> dict[str, Any]:
+        # ydotool can move and click reliably; drag support is best-effort and
+        # falls back to X11 if available for the current session.
+        if _can_import_pyautogui():
+            return _X11InteractBackend(self.base).drag(args)
+        return {"error": "drag is not supported by the available Wayland helpers"}
+
+    def scroll(self, dy: int) -> dict[str, Any]:
+        if _can_import_pyautogui():
+            return _X11InteractBackend(self.base).scroll(dy)
+        return {"error": "scroll is not supported by the available Wayland helpers"}
+
+    def type_text(self, text: str) -> dict[str, Any]:
+        _run_wayland_command(["ydotool", "type", str(text)])
+        return {"ok": True, "action": "type_text"}
+
+    def press_key(self, key: str) -> dict[str, Any]:
+        seq = _wayland_key_sequence([key])
+        _run_wayland_command(["ydotool", "key", *seq])
+        return {"ok": True, "action": "press_key", "key": key}
+
+    def hotkey(self, keys: list[str]) -> dict[str, Any]:
+        seq = _wayland_key_sequence(keys)
+        _run_wayland_command(["ydotool", "key", *seq])
+        return {"ok": True, "action": "hotkey", "keys": [str(k) for k in keys]}
+
+
+def _select_interact_backend(base: Path | None = None) -> _InteractBackend:
+    base_path = base or Path.cwd()
+    if _wayland_helpers_available():
+        return _WaylandInteractBackend(base_path)
+    if _x11_fallback_available() and _can_import_pyautogui():
+        return _X11InteractBackend(base_path)
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland":
+        if not _wayland_input_available():
+            raise RuntimeError(
+                "Wayland session detected but ydotool is missing. "
+                "Install ydotool (and keep grim for screenshots) or switch to an X11 session with a valid Xauthority file."
+            )
+    raise RuntimeError("No supported Interact backend is available")
+
+
 def _interact_tool() -> dict[str, Any]:
     return {
         "type": "function",
@@ -66,6 +421,7 @@ def _interact_tool() -> dict[str, Any]:
             "name": "interact",
             "description": (
                 "Use the local computer by taking screenshots and controlling mouse and keyboard. "
+                "Prefer Wayland helpers when available, and fall back to X11 pyautogui when not. "
                 "Supported actions: screenshot, move_mouse, click, double_click, right_click, drag, "
                 "scroll, type_text, press_key, hotkey, sleep."
             ),
@@ -844,76 +1200,41 @@ def interact(base: Path, args: dict[str, object]) -> str:
     action = str(args.get("action", "")).strip().lower()
     if not action:
         return json.dumps({"error": "empty action"})
-
     try:
-        import pyautogui
+        backend = _select_interact_backend(base)
     except Exception as e:
-        return json.dumps({
-            "error": f"pyautogui is not installed or failed to import: {e}",
-        })
-
-    try:
-        pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.05
-    except Exception:
-        pass
+        return json.dumps({"error": str(e), "action": action})
 
     approved, denial_msg = _approve_interact(action)
     if not approved:
         return json.dumps({"error": "user_denied", "message": denial_msg, "action": action})
 
-    def _shot() -> dict[str, Any]:
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        path = base / f".mahanai-interact-{ts}.png"
-        img = pyautogui.screenshot()
-        img.save(path)
-        return {
-            "ok": True,
-            "path": str(path),
-            "size": [img.size[0], img.size[1]],
-        }
-
     try:
         if action == "screenshot":
-            return json.dumps(_shot())
+            return json.dumps(backend.screenshot())
         if action == "move_mouse":
-            pyautogui.moveTo(int(args.get("x", 0)), int(args.get("y", 0)), duration=0.15)
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.move_mouse(int(args.get("x", 0)), int(args.get("y", 0))))
         if action == "click":
-            pyautogui.click(
-                x=args.get("x"),
-                y=args.get("y"),
-                clicks=int(args.get("clicks") or 1),
-                button=str(args.get("button") or "left"),
-            )
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.click(args))
         if action == "double_click":
-            pyautogui.doubleClick(x=args.get("x"), y=args.get("y"), button=str(args.get("button") or "left"))
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.double_click(args))
         if action == "right_click":
-            pyautogui.rightClick(x=args.get("x"), y=args.get("y"))
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.right_click(args))
         if action == "drag":
-            pyautogui.dragTo(int(args.get("x", 0)), int(args.get("y", 0)), duration=0.3, button=str(args.get("button") or "left"))
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.drag(args))
         if action == "scroll":
-            pyautogui.scroll(int(args.get("dy") or 0))
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.scroll(int(args.get("dy") or 0)))
         if action == "type_text":
-            pyautogui.write(str(args.get("text", "")), interval=0.01)
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.type_text(str(args.get("text", ""))))
         if action == "press_key":
-            pyautogui.press(str(args.get("key", "")))
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.press_key(str(args.get("key", ""))))
         if action == "hotkey":
             keys = args.get("keys") or []
             if not isinstance(keys, list) or not keys:
                 return json.dumps({"error": "keys must be a non-empty array"})
-            pyautogui.hotkey(*[str(k) for k in keys])
-            return json.dumps({"ok": True, "action": action, "keys": [str(k) for k in keys]})
+            return json.dumps(backend.hotkey([str(k) for k in keys]))
         if action == "sleep":
-            time.sleep(max(0.0, float(args.get("seconds") or 0.0)))
-            return json.dumps({"ok": True, "action": action})
+            return json.dumps(backend.sleep(float(args.get("seconds") or 0.0)))
         return json.dumps({"error": f"unknown interact action: {action}"})
     except Exception as e:
         return json.dumps({"error": str(e), "action": action})

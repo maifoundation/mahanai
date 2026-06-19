@@ -57,7 +57,7 @@ On macOS, you can also double-click `scripts/get-started.command` from Finder.
 - **Custom themes** — write `.mai` theme files with gradients, color aliases, and display name overrides
 - **Multi-model** — Claude (via Claude Code), NVIDIA NIM, OpenAI Codex, Ollama, and any OpenAI-compatible endpoint
 - **Agentic tools** — shell commands, file read/write/edit, web search, Python REPL, URL fetch — all with approval prompts and inline diffs
-- **Interact mode** — enable once with `/interact` to let MahanAI control your computer with screenshots, mouse, and keyboard; remove it later with `/interact remove`
+- **Interact mode** — enable once with `/interact` to let MahanAI control your computer with screenshots, mouse, and keyboard; Wayland helpers are used first, with X11 as a fallback; remove it later with `/interact remove`
 - **Plan mode & effort levels** — `/plan on` to outline before acting; `/effort high` for deeper reasoning
 - **Conversation branching** — save and restore conversation states to explore multiple paths
 - **Searchable chat history** — search saved chats by keyword with `/history search <query>`
@@ -171,7 +171,7 @@ load(python-dev-kit)
 | `/effort <low\|medium\|high\|very-high>` | Set reasoning depth |
 | `/plan on\|off` | Outline approach before every response |
 | `/auto on\|off` | Autonomous mode (skip approval prompts) |
-| `/interact` | Enable computer control with screenshots, mouse, and keyboard |
+| `/interact` | Enable computer control with screenshots, mouse, and keyboard; Wayland first, X11 fallback |
 | `/interact remove` | Disable computer control and remove the feature |
 | `/branch save <name>` | Snapshot conversation state |
 | `/branch load <name>` | Restore a snapshot |
