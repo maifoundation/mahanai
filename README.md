@@ -32,7 +32,7 @@ pip install mahanai
 mahanai
 ```
 
-That's it. An onboarding wizard runs on first launch to help you pick a model and set up API keys.
+That's it. An onboarding wizard runs on first launch to help you pick a model, set up API keys, and connect GitHub for the plugin marketplace.
 
 If you want a guided bootstrap that installs `uv`, installs Python through `uv`, installs `mahanai`, and launches it, use one of the included get-started scripts:
 
@@ -77,7 +77,7 @@ mahanai --server --type anthropic         # Anthropic-compatible
 mahanai --server --port 9000 --api-key sk-gaming
 ```
 
-Point any OpenAI-compatible client at `http://localhost:8080` and use model IDs like `claude-sonnet-4-6`, `meta/llama-3.3-70b-instruct`, or your Ollama model name — MahanAI routes and converts formats automatically, including SSE streaming end-to-end.
+Point any OpenAI-compatible client at `http://localhost:8080` and use model IDs like `claude-sonnet-4-6`, `meta/llama-3.3-70b-instruct`, `gpt-5.4-indirect`, or your Ollama model name — MahanAI routes and converts formats automatically, including SSE streaming end-to-end.
 
 A browser-based chat UI is also available at `http://localhost:8080` when the server is running.
 
@@ -92,6 +92,7 @@ Switch models interactively with `/models` or quick-switch with `/mode claude` /
 | **Claude** (Opus, Sonnet, Haiku) | Install [Claude Code](https://claude.ai/code) and sign in |
 | **NVIDIA NIM** (Llama 3.3 70B) | `/api-key-nvidia your-key` |
 | **OpenAI Codex** | `/codex-login` (browser OAuth, no API key needed) |
+| **GitHub plugin store** | `/store login` (OAuth when configured, PAT fallback otherwise) |
 | **Ollama** | `/add-ollama name localhost 11434` |
 | **Any OpenAI-compatible API** | `/custom http://your-server/v1 model-name` |
 
@@ -122,6 +123,11 @@ Publishing your own plugin is one command:
 ```
 
 This creates a public GitHub repo, pushes the `.mmd` file, and tags it so it shows up in `/store browse`.
+
+GitHub auth for the store works in two modes:
+
+- Set `MAHANAI_GITHUB_CLIENT_ID` and run `/store login` for browser/device-flow OAuth
+- Leave it unset and `/store login` falls back to a GitHub personal access token prompt
 
 ---
 
@@ -195,6 +201,7 @@ Full command reference: [mahancreate.github.io/mahanai](https://mahancreate.gith
 | NVIDIA direct | `/api-key-nvidia your-key` |
 | Claude | Handled by Claude Code — no extra config |
 | OpenAI Codex | `/codex-login` (browser OAuth) |
+| GitHub plugin store | `/store login` (OAuth if `MAHANAI_GITHUB_CLIENT_ID` is set, otherwise PAT) |
 
 Keys are stored in `~/.config/mahanai/config.json` (Linux/macOS) or `%APPDATA%\MahanAI\config.json` (Windows).
 
@@ -208,6 +215,7 @@ Keys are stored in `~/.config/mahanai/config.json` (Linux/macOS) or `%APPDATA%\M
 | `MAHANAI_MODEL` | Override default model |
 | `MAHANAI_STREAM` | Set to `0` to disable streaming |
 | `MAHANAI_CONFIG_DIR` | Override config directory |
+| `MAHANAI_GITHUB_CLIENT_ID` | Enable GitHub OAuth for `/store login` |
 | `NO_COLOR` | Disable terminal colors |
 
 ---

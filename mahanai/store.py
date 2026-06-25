@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
+
+import httpx
 
 from .mmd_parser import MmdPlugin, parse_mmd_file
 
 GH_API = "https://api.github.com"
 STORE_TOPIC = "mahanai-plugin"
 _UA = "MahanAI-Store/1.0"
+GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
+GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_DEVICE_SCOPE = "read:user public_repo"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +76,74 @@ def remove_store_token() -> None:
 def whoami(token: str) -> str:
     """Return the authenticated GitHub username."""
     return _gh("GET", "/user", token=token)["login"]  # type: ignore[index]
+
+
+def github_client_id() -> str | None:
+    client_id = os.environ.get("MAHANAI_GITHUB_CLIENT_ID", "").strip()
+    return client_id or None
+
+
+def _request_device_code(client_id: str) -> dict[str, object]:
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.post(
+            GITHUB_DEVICE_CODE_URL,
+            headers={"Accept": "application/json", "User-Agent": _UA},
+            data={"client_id": client_id, "scope": GITHUB_DEVICE_SCOPE},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    if not payload.get("device_code"):
+        raise RuntimeError("GitHub device flow did not return a device_code")
+    return payload
+
+
+def _poll_device_access_token(client_id: str, device_code: str, interval: int) -> str:
+    wait_seconds = max(interval, 1)
+    with httpx.Client(timeout=20.0) as client:
+        while True:
+            time.sleep(wait_seconds)
+            resp = client.post(
+                GITHUB_ACCESS_TOKEN_URL,
+                headers={"Accept": "application/json", "User-Agent": _UA},
+                data={
+                    "client_id": client_id,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            access_token = payload.get("access_token")
+            if access_token:
+                return access_token
+            error = payload.get("error")
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                wait_seconds += 5
+                continue
+            desc = payload.get("error_description") or error or "unknown error"
+            raise RuntimeError(f"GitHub device login failed: {desc}")
+
+
+def github_device_login(open_browser: bool = True) -> str:
+    client_id = github_client_id()
+    if not client_id:
+        raise RuntimeError("Set MAHANAI_GITHUB_CLIENT_ID to enable GitHub marketplace OAuth.")
+
+    payload = _request_device_code(client_id)
+    verification_url = str(payload.get("verification_uri_complete") or payload.get("verification_uri") or "").strip()
+    if open_browser and verification_url:
+        webbrowser.open(verification_url)
+
+    access_token = _poll_device_access_token(
+        client_id,
+        str(payload.get("device_code") or ""),
+        int(payload.get("interval") or 5),
+    )
+    username = whoami(access_token)
+    save_store_token(access_token)
+    return username
 
 
 # ---------------------------------------------------------------------------

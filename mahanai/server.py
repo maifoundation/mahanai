@@ -15,6 +15,10 @@ from typing import Any
 
 # Path to the custom web UI file (next to this package)
 _WEBUI_PATH = Path(__file__).parent.parent / "webui.html"
+try:
+    _WEBUI_HTML_BYTES = _WEBUI_PATH.read_bytes()
+except OSError:
+    _WEBUI_HTML_BYTES = b"<h1>MahanAI Web UI</h1><p>Embedded web UI asset unavailable.</p>"
 
 import httpx
 
@@ -38,13 +42,13 @@ _ROUTES: dict[str, tuple[str, str]] = {
     "claude-opus-4-7":             ("claude",        "claude-opus-4-7"),
     "claude-sonnet-4-6":           ("claude",        "claude-sonnet-4-6"),
     "claude-haiku-4-5-20251001":   ("claude",        "claude-haiku-4-5-20251001"),
-    "gpt-5.4":                     ("codex_direct",  "gpt-5.4"),
-    "gpt-5.2-codex":               ("codex_direct",  "gpt-5.2-codex"),
-    "gpt-5.1-codex-max":           ("codex_direct",  "gpt-5.1-codex-max"),
-    "gpt-5.4-mini":                ("codex_direct",  "gpt-5.4-mini"),
-    "gpt-5.3-codex":               ("codex_direct",  "gpt-5.3-codex"),
-    "gpt-5.2":                     ("codex_direct",  "gpt-5.2"),
-    "gpt-5.1-codex-mini":          ("codex_direct",  "gpt-5.1-codex-mini"),
+    "gpt-5.4-indirect":            ("codex_direct",  "gpt-5.4"),
+    "gpt-5.2-codex-indirect":      ("codex_direct",  "gpt-5.2-codex"),
+    "gpt-5.1-codex-max-indirect":  ("codex_direct",  "gpt-5.1-codex-max"),
+    "gpt-5.4-mini-indirect":       ("codex_direct",  "gpt-5.4-mini"),
+    "gpt-5.3-codex-indirect":      ("codex_direct",  "gpt-5.3-codex"),
+    "gpt-5.2-indirect":            ("codex_direct",  "gpt-5.2"),
+    "gpt-5.1-codex-mini-indirect": ("codex_direct",  "gpt-5.1-codex-mini"),
 }
 
 _MODEL_DISPLAY = {
@@ -53,14 +57,32 @@ _MODEL_DISPLAY = {
     "claude-opus-4-7":             ("Claude Opus 4",           "Anthropic"),
     "claude-sonnet-4-6":           ("Claude Sonnet 4.6",       "Anthropic"),
     "claude-haiku-4-5-20251001":   ("Claude Haiku 4.5",        "Anthropic"),
-    "gpt-5.4":                     ("GPT-5.4",                 "OpenAI Codex"),
-    "gpt-5.2-codex":               ("GPT-5.2-Codex",           "OpenAI Codex"),
-    "gpt-5.1-codex-max":           ("GPT-5.1-Codex-Max",       "OpenAI Codex"),
-    "gpt-5.4-mini":                ("GPT-5.4-Mini",            "OpenAI Codex"),
-    "gpt-5.3-codex":               ("GPT-5.3-Codex",           "OpenAI Codex"),
-    "gpt-5.2":                     ("GPT-5.2",                 "OpenAI Codex"),
-    "gpt-5.1-codex-mini":          ("GPT-5.1-Codex-Mini",      "OpenAI Codex"),
+    "gpt-5.4-indirect":            ("GPT-5.4 Indirect",        "OpenAI Codex"),
+    "gpt-5.2-codex-indirect":      ("GPT-5.2-Codex Indirect",  "OpenAI Codex"),
+    "gpt-5.1-codex-max-indirect":  ("GPT-5.1-Codex-Max Indirect", "OpenAI Codex"),
+    "gpt-5.4-mini-indirect":       ("GPT-5.4-Mini Indirect",   "OpenAI Codex"),
+    "gpt-5.3-codex-indirect":      ("GPT-5.3-Codex Indirect",  "OpenAI Codex"),
+    "gpt-5.2-indirect":            ("GPT-5.2 Indirect",        "OpenAI Codex"),
+    "gpt-5.1-codex-mini-indirect": ("GPT-5.1-Codex-Mini Indirect", "OpenAI Codex"),
 }
+
+
+def _webui_bytes() -> bytes:
+    """Return the bundled web UI bytes without request-time disk access."""
+    return _WEBUI_HTML_BYTES
+
+
+def _openai_model_data(custom_endpoint: dict[str, Any] | None) -> list[dict[str, Any]]:
+    created = int(time.time())
+    data = [{"id": mid, "object": "model", "created": created, "owned_by": "mahanai"} for mid in _ROUTES]
+    if custom_endpoint:
+        data.append({
+            "id": custom_endpoint.get("model", "custom"),
+            "object": "model",
+            "created": created,
+            "owned_by": "custom",
+        })
+    return data
 
 
 # ── Server configuration ──────────────────────────────────────────────────────
@@ -260,17 +282,10 @@ def _make_handler(cfg: ServerConfig) -> type:
         # ── /v1/models ────────────────────────────────────────────────────────
 
         def _handle_models(self) -> None:
-            created = int(time.time())
             if cfg.server_type == "openai":
-                data = [
-                    {"id": mid, "object": "model", "created": created, "owned_by": "mahanai"}
-                    for mid in _ROUTES
-                ]
-                if cfg.custom_endpoint:
-                    data.append({"id": cfg.custom_endpoint.get("model", "custom"),
-                                 "object": "model", "created": created, "owned_by": "custom"})
-                self._json(200, {"object": "list", "data": data})
+                self._json(200, {"object": "list", "data": _openai_model_data(cfg.custom_endpoint)})
             else:
+                created = int(time.time())
                 data_anth = [
                     {
                         "id":           mid,
@@ -287,14 +302,7 @@ def _make_handler(cfg: ServerConfig) -> type:
         # ── Web UI ────────────────────────────────────────────────────────────
 
         def _serve_web_ui(self) -> None:
-            try:
-                # Use absolute path and verify it is exactly what we expect to prevent directory traversal
-                if _WEBUI_PATH.exists() and _WEBUI_PATH.is_file():
-                    body_bytes = _WEBUI_PATH.read_bytes()
-                else:
-                    raise OSError("UI file missing")
-            except OSError:
-                body_bytes = b"<h1>MahanAI Web UI</h1><p>webui.html not found next to the package.</p>"
+            body_bytes = _webui_bytes()
             self.send_response(200)
             self._cors_headers()
             self.send_header("Content-Type", "text/html; charset=utf-8")

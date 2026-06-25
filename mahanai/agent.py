@@ -319,13 +319,13 @@ AVAILABLE_MODELS: list[dict] = [
     {"label": "GPT-5.3-Codex",         "name": "gpt-5.3-codex",              "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.2",               "name": "gpt-5.2",                    "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.1-Codex-Mini",    "name": "gpt-5.1-codex-mini",         "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
-    {"label": "GPT-5.4",               "name": "gpt-5.4",                    "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
-    {"label": "GPT-5.2-Codex",         "name": "gpt-5.2-codex",              "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
-    {"label": "GPT-5.1-Codex-Max",     "name": "gpt-5.1-codex-max",          "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
-    {"label": "GPT-5.4-Mini",          "name": "gpt-5.4-mini",               "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
-    {"label": "GPT-5.3-Codex",         "name": "gpt-5.3-codex",              "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
-    {"label": "GPT-5.2",               "name": "gpt-5.2",                    "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
-    {"label": "GPT-5.1-Codex-Mini",    "name": "gpt-5.1-codex-mini",         "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.4",               "name": "gpt-5.4-indirect",           "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.2-Codex",         "name": "gpt-5.2-codex-indirect",     "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.1-Codex-Max",     "name": "gpt-5.1-codex-max-indirect", "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.4-Mini",          "name": "gpt-5.4-mini-indirect",      "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.3-Codex",         "name": "gpt-5.3-codex-indirect",     "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.2",               "name": "gpt-5.2-indirect",           "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.1-Codex-Mini",    "name": "gpt-5.1-codex-mini-indirect","note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
     {"label": "Custom Endpoint",        "name": "custom",                      "note": "custom",   "group": "Custom",                 "mode": "custom"},
 ]
 
@@ -532,6 +532,13 @@ _MODEL_PRICING: dict[str, tuple[float, float]] = {
     "gpt-5.1-codex-max":           (5.0,   20.0),
     "gpt-5.2":                     (2.5,   10.0),
     "gpt-5.1-codex-mini":          (0.15,   0.6),
+    "gpt-5.4-indirect":            (10.0,  30.0),
+    "gpt-5.4-mini-indirect":       (0.15,   0.6),
+    "gpt-5.2-codex-indirect":      (3.0,   15.0),
+    "gpt-5.3-codex-indirect":      (3.0,   15.0),
+    "gpt-5.1-codex-max-indirect":  (5.0,   20.0),
+    "gpt-5.2-indirect":            (2.5,   10.0),
+    "gpt-5.1-codex-mini-indirect": (0.15,   0.6),
     "meta/llama-3.3-70b-instruct": (0.35,   0.4),
 }
 
@@ -671,6 +678,10 @@ def _run_onboarding_wizard() -> None:
     else:
         save_default_model(DEFAULT_MODEL)
 
+    gh_choice = input(f"\n  {C.DIM}Set up GitHub marketplace access now? [Y/n]: {C.RST}").strip().lower()
+    if gh_choice in ("", "y", "yes"):
+        _run_github_store_login()
+
     print(f"\n{C.OK}5 commands to know:{C.RST}")
     print(f"  {C.OK}/models{C.RST}   {C.DIM}switch models interactively{C.RST}")
     print(f"  {C.OK}/cmd{C.RST}      {C.DIM}search all commands (command palette){C.RST}")
@@ -680,6 +691,28 @@ def _run_onboarding_wizard() -> None:
 
     print(f"\n{C.DIM}TAB completes slash commands. Type /help anytime.{C.RST}\n")
     mark_onboarding_complete()
+
+
+def _run_github_store_login() -> str | None:
+    from . import store as _store
+
+    try:
+        if _store.github_client_id():
+            print(f"\n{C.OK}Starting GitHub device login for the plugin marketplace...{C.RST}")
+            _gh_user = _store.github_device_login()
+        else:
+            print(f"\n{C.DIM}GitHub OAuth is not configured. Falling back to a personal access token.{C.RST}")
+            _tok = input(f"  {C.DIM}GitHub personal access token: {C.RST}").strip()
+            if not _tok:
+                print(f"{C.WARN}GitHub marketplace login skipped.{C.RST}\n")
+                return None
+            _gh_user = _store.whoami(_tok)
+            _store.save_store_token(_tok)
+        print(f"{C.OK}Logged in to GitHub as:{C.RST} {_gh_user}\n")
+        return _gh_user
+    except Exception as _se:
+        print(f"{C.WARN}GitHub marketplace login skipped:{C.RST} {_se}\n")
+        return None
 
 _EFFORT_CODEX: dict[str, str] = {
     "low":       "low",
@@ -1087,6 +1120,12 @@ def _load_codex_indirect_key() -> str | None:
             except Exception:
                 pass
     return None
+
+
+def _codex_indirect_backend_model(model_name: str) -> str:
+    if model_name.endswith("-indirect"):
+        return model_name[:-len("-indirect")]
+    return model_name
 
 
 def _run_codex_cli(prompt: str, model: str | None = None) -> None:
@@ -1811,7 +1850,7 @@ def _print_help(term: str = "") -> None:
         f"  /plugin-load <path>         Load a .mmd plugin file\n"
         f"  /plugin-list                Show all loaded plugins and their commands\n"
         f"  /plugin-unload <name>       Unload a plugin by name\n"
-        f"  /store login <token>        Link your GitHub account to the plugin store\n"
+        f"  /store login [token]        Link your GitHub account to the plugin store\n"
         f"  /store logout               Unlink GitHub account\n"
         f"  /store browse               Browse all published plugins\n"
         f"  /store search <query>       Search plugins\n"
@@ -2458,7 +2497,7 @@ def main() -> None:
                 if _sub == "login":
                     _tok = _srest.strip()
                     if not _tok:
-                        print(f"{C.ERR}Usage: /store login <github-personal-access-token>{C.RST}\n")
+                        _run_github_store_login()
                     else:
                         try:
                             _gh_user = _store.whoami(_tok)
@@ -2528,7 +2567,7 @@ def main() -> None:
                     else:
                         _stok = _store.get_store_token()
                         if not _stok:
-                            print(f"{C.ERR}Not logged in. Run: /store login <github-token>{C.RST}\n")
+                            print(f"{C.ERR}Not logged in. Run: /store login{C.RST}\n")
                         else:
                             from pathlib import Path as _Path
                             _up_pp = _Path(_up_path).expanduser().resolve()
@@ -2582,7 +2621,7 @@ def main() -> None:
                 else:
                     print(
                         f"{C.DIM}Store commands:{C.RST}\n"
-                        f"  /store login <token>        Link your GitHub account\n"
+                        f"  /store login [token]        Link your GitHub account\n"
                         f"  /store logout               Unlink GitHub account\n"
                         f"  /store browse               Browse all available plugins\n"
                         f"  /store search <query>       Search plugins by name/keyword\n"
@@ -3982,11 +4021,12 @@ def main() -> None:
 
         if selected["mode"] == "codex_indirect":
             indirect_token = _load_codex_indirect_key()
+            backend_model = _codex_indirect_backend_model(selected["name"])
             if indirect_token:
                 history.append({"role": "user", "content": _user_content(effective_user)})
                 print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
                 try:
-                    reply = _stream_wham(indirect_token, None, history, selected["name"], codex_effort, workspace)
+                    reply = _stream_wham(indirect_token, None, history, backend_model, codex_effort, workspace)
                 except (httpx.HTTPStatusError, httpx.RequestError) as e:
                     print()
                     print(f"{C.ERR}[Codex Indirect error]{C.RST} {e}\n")
@@ -3997,7 +4037,7 @@ def main() -> None:
                 _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
             else:
                 print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
-                _run_codex_cli(effective_user, model=selected["name"])
+                _run_codex_cli(effective_user, model=backend_model)
                 print("\n")
             continue
 
