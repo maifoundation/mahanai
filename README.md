@@ -17,6 +17,8 @@
 
 ---
 
+<img alt="preview of MahanAI in action" src="./preview.png">
+
 ## What is MahanAI?
 
 MahanAI is a terminal AI agent you install with pip. It gives you a powerful chat interface, agentic tool use (run commands, read/write files, search the web), and a **local gateway server** that makes all your configured AI providers available as a single unified API endpoint — so any tool that speaks OpenAI or Anthropic format can point at it.
