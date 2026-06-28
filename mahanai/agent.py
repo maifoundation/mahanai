@@ -597,6 +597,9 @@ _ALL_COMMANDS: list[tuple[str, str]] = [
     ("/voice",            "Toggle voice input: on|off"),
     ("/auto",             "Toggle autonomous mode (skip approval prompts): on|off"),
     ("/interact",         "Enable or remove computer control"),
+    ("/connect",          "Show connect status and manage session grants"),
+    ("/connect grants",   "Show active connect session grants"),
+    ("/connect revoke",   "Clear active connect session grants"),
     ("/vim",              "Toggle vim keybindings for the prompt: on|off"),
     ("/notify",           "Send a test desktop notification"),
     ("/shell-history",    "Show recent shell history; inject to add to context"),
@@ -1504,6 +1507,11 @@ def build_system_prompt(
         "or two mkdir calls). "
         "Use read_file, write_file, edit_file, list_directory, append_file, fetch_url, python_repl, web_search "
         "when they fit the task. "
+        "Use connect_get_config_view, connect_request_config_change, connect_run_user_command, and "
+        "connect_request_rerun when you need to inspect safe MahanAI settings, request an approved "
+        "non-secret config change, run a command through the connect permission path, or ask the user "
+        "to rerun MahanAI with different permissions. Connect never exposes or changes API keys, tokens, "
+        "or endpoint credentials. "
         "For targeted file edits (changing a specific function or block) prefer edit_file over write_file — "
         "it takes old_string and new_string and applies a surgical replacement with a diff preview. "
         "The terminal will ask the user before obviously destructive commands (recursive deletes, "
@@ -1824,6 +1832,9 @@ def _print_help(term: str = "") -> None:
         f"  /voice on|off               Toggle voice input (requires SpeechRecognition)\n"
         f"  /auto on|off                Autonomous mode — skip approval prompts (destructive cmds still ask)\n"
         f"  /interact [remove]          Enable or remove computer control (Wayland-first, X11 fallback)\n"
+        f"  /connect                    Show connect status and safety rules\n"
+        f"  /connect grants             Show active connect session grants\n"
+        f"  /connect revoke             Clear active connect session grants\n"
         f"  /vim on|off                 Vim keybindings for the prompt (Esc → normal, i → insert)\n"
         f"  /notify [title]             Send a test desktop notification\n"
         f"  /shell-history              Show recent shell history\n"
@@ -2263,6 +2274,29 @@ def main() -> None:
                         if file_ops:
                             print(f"  File ops:   {', '.join(file_ops)}")
                         print()
+                continue
+            if cmd == "/connect":
+                from mahanai.connect import clear_session_grants, get_connect_status
+
+                sub = rest.strip().lower()
+                if sub == "revoke":
+                    clear_session_grants()
+                    print(f"{C.OK}Connect session grants cleared.{C.RST}\n")
+                elif sub == "grants":
+                    _status = get_connect_status()
+                    print(f"{C.DIM}Connect session grants:{C.RST}")
+                    print(f"  Config changes: {'active' if _status.get('config_session_granted') else 'inactive'}")
+                    print(f"  Commands:       {'active' if _status.get('command_session_granted') else 'inactive'}")
+                    print()
+                elif sub:
+                    print(f"{C.ERR}Usage:{C.RST} /connect  |  /connect grants  |  /connect revoke\n")
+                else:
+                    _status = get_connect_status()
+                    print(f"{C.DIM}Connect lets the agent request approved non-secret config changes and approved command execution.{C.RST}")
+                    print(f"{C.DIM}Secrets such as API keys, tokens, and endpoint credentials are never exposed through connect.{C.RST}")
+                    print(f"  Config session grant: {'active' if _status.get('config_session_granted') else 'inactive'}")
+                    print(f"  Command session grant: {'active' if _status.get('command_session_granted') else 'inactive'}")
+                    print(f"{C.DIM}Use /connect grants to inspect grants or /connect revoke to clear them.{C.RST}\n")
                 continue
             if cmd == "/themes":
                 sub = rest.strip().lower().replace(" ", "-")

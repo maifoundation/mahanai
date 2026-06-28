@@ -455,10 +455,76 @@ def _interact_tool() -> dict[str, Any]:
 def get_tools() -> list[dict[str, Any]]:
     from mahanai.config import load_interact_enabled
 
-    tools = list(TOOLS)
+    tools = list(TOOLS) + list(CONNECT_TOOLS)
     if load_interact_enabled():
         tools.append(_interact_tool())
     return tools
+
+
+CONNECT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_get_config_view",
+            "description": "Return a sanitized view of MahanAI config and active connect grants. Secrets are omitted.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_request_config_change",
+            "description": "Request approved changes to non-secret MahanAI config fields.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "changes": {
+                        "type": "object",
+                        "description": "Non-secret config key/value changes to request.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this config change is needed.",
+                    },
+                },
+                "required": ["changes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_run_user_command",
+            "description": "Request approved shell command execution through the connect permission path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Full shell command to execute."},
+                    "cwd": {"type": "string", "description": "Optional working directory."},
+                    "timeout_seconds": {"type": "integer", "description": "Max seconds to wait."},
+                    "reason": {"type": "string", "description": "Why this command is needed."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_request_rerun",
+            "description": "Generate a rerun handoff request for the user without changing config or running commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string"},
+                    "suggested_command": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+]
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -700,6 +766,45 @@ def _read_input(prompt: str) -> str:
     except (EOFError, KeyboardInterrupt):
         print()
         return ""
+
+
+def _approve_connect_config(summary: dict[str, Any]) -> str:
+    print(f"\n{C.WARN}  Connect Config Change{C.RST}")
+    reason = str(summary.get("reason") or "").strip()
+    if reason:
+        print(f"  {C.DIM}Reason: {reason}{C.RST}")
+    for change in summary.get("changes", []):
+        key = change.get("key", "")
+        before = json.dumps(change.get("before"), sort_keys=True)
+        after = json.dumps(change.get("after"), sort_keys=True)
+        print(f"  {C.DIM}{key}: {before} -> {after}{C.RST}")
+    print(f"  {C.OK}[A]{C.RST} Allow Once    {C.DIM}[S] Allow for Session{C.RST}    {C.ERR}[D]{C.RST} Deny")
+    ans = _read_input("  > ").lower()
+    if ans in ("a", "allow", "allow once", "once"):
+        return "allow-once"
+    if ans in ("s", "session", "allow session", "allow for session"):
+        return "allow-session"
+    return "deny"
+
+
+def _approve_connect_command(summary: dict[str, Any]) -> str:
+    high_risk = bool(summary.get("high_risk"))
+    print(f"\n{C.WARN}  Connect Command{C.RST}{'  ' + C.ERR + '[DESTRUCTIVE]' + C.RST if high_risk else ''}")
+    reason = str(summary.get("reason") or "").strip()
+    if reason:
+        print(f"  {C.DIM}Reason: {reason}{C.RST}")
+    print(f"  {C.DIM}{summary.get('command', '')}{C.RST}")
+    print(f"  {C.DIM}cwd: {summary.get('cwd', '')}{C.RST}")
+    if high_risk:
+        print(f"  {C.OK}[A]{C.RST} Allow Once    {C.ERR}[D]{C.RST} Deny")
+    else:
+        print(f"  {C.OK}[A]{C.RST} Allow Once    {C.DIM}[S] Allow for Session{C.RST}    {C.ERR}[D]{C.RST} Deny")
+    ans = _read_input("  > ").lower()
+    if ans in ("a", "allow", "allow once", "once"):
+        return "allow-once"
+    if not high_risk and ans in ("s", "session", "allow session", "allow for session"):
+        return "allow-session"
+    return "deny"
 
 
 def _approve_command(cmd: str) -> tuple[bool, str]:
@@ -1440,6 +1545,29 @@ def execute_tool(name: str, arguments_json: str, workspace: Path) -> str:
         result = web_search(workspace, args)
     elif name == "interact":
         result = interact(workspace, args)
+    elif name == "connect_get_config_view":
+        from mahanai.connect import get_config_view
+
+        result = json.dumps(get_config_view())
+    elif name == "connect_request_config_change":
+        from mahanai.connect import request_config_change
+
+        changes = args.get("changes")
+        result = json.dumps(
+            request_config_change(
+                changes if isinstance(changes, dict) else {},
+                approve=_approve_connect_config,
+                reason=str(args.get("reason", "")).strip(),
+            )
+        )
+    elif name == "connect_run_user_command":
+        from mahanai.connect import run_user_command
+
+        result = json.dumps(run_user_command(workspace, args, approve=_approve_connect_command))
+    elif name == "connect_request_rerun":
+        from mahanai.connect import request_rerun
+
+        result = json.dumps(request_rerun(args))
     else:
         return json.dumps({"error": f"unknown tool: {name}"})
 

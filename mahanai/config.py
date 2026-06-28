@@ -50,6 +50,18 @@ def _write_config(data: dict[str, Any]) -> None:
             pass
 
 
+def load_raw_config() -> dict[str, Any]:
+    """Return a shallow copy of the persisted config for policy-filtered callers."""
+    return dict(_read_config())
+
+
+def save_config_value(key: str, value: Any) -> None:
+    data = _read_config()
+    data[key] = value
+    _write_config(data)
+    _invalidate_cache(key)
+
+
 def load_saved_api_key() -> str | None:
     key = (_read_config().get("api_key") or "").strip()
     return key or None
