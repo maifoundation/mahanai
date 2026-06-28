@@ -17,7 +17,7 @@
 
 ---
 
-<img alt="preview of MahanAI in action" src="./preview.png">
+<img width="1353" height="728" alt="preview" src="https://github.com/user-attachments/assets/d72121df-0fd1-4305-b6dd-fc339af1226e" />
 
 ## What is MahanAI?
 
