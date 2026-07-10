@@ -973,6 +973,9 @@ def run_command(base: Path, args: dict[str, object]) -> str:
     if isinstance(cwd_raw, str) and cwd_raw.strip():
         cwd = _resolve_path(base, cwd_raw)
 
+    if cmd.lower() == "pwd":
+        return json.dumps({"exit_code": 0, "output": f"{cwd}\n", "cwd": str(cwd)})
+
     approved, denial_msg = _approve_command(cmd)
     if not approved:
         return json.dumps({
@@ -1461,6 +1464,8 @@ def batch_approve_and_execute(
             cwd = workspace
             if isinstance(cwd_raw, str) and cwd_raw.strip():
                 cwd = _resolve_path(workspace, cwd_raw)
+            if cmd.lower() == "pwd":
+                return cid, json.dumps({"exit_code": 0, "output": f"{cwd}\n", "cwd": str(cwd)})
             print(f"\n{C.OK}⚡Running:{C.RST} {cmd}", flush=True)
             try:
                 proc = subprocess.run(

@@ -243,7 +243,16 @@ def _scan_action(action: MmdAction, trigger: str) -> SecurityIssue | None:
                 message=msg or "Claude command",
                 snippet=action.value[:80],
             )
-    
+
+    elif action.type == "tk-window":
+        return SecurityIssue(
+            level=ThreatLevel.WARNING,
+            action_type="tk-window",
+            trigger=trigger,
+            message="Tk window launches execute embedded Python code",
+            snippet=action.value[:80],
+        )
+
     return None
 
 

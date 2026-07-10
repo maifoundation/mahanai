@@ -104,7 +104,7 @@ Switch models interactively with `/models` or quick-switch with `/mode claude` /
 
 ## Plugins
 
-Plugins are `.mmd` files that register new slash commands. They can delegate to Claude Code, MahanAI itself, or the shell.
+Plugins are `.mmd` files that register new slash commands. They can delegate to Claude Code, MahanAI itself, or the shell, and they can now also embed default `.mai` themes or launch Tk windows from a trigger.
 
 ```bash
 # Install from the store
@@ -130,6 +130,41 @@ GitHub auth for the store works in two modes:
 
 - Set `MAHANAI_GITHUB_CLIENT_ID` and run `/store login` for browser/device-flow OAuth
 - Leave it unset and `/store login` falls back to a GitHub personal access token prompt
+
+### Plugin Extras
+
+You can embed a default theme directly inside a plugin with `newdeftheme(...)`:
+
+```text
+newdeftheme(
+theme.name = example-neon
+theme.pretty.name = Example Neon
+
+sky = #5B8DEF
+mint = #34D399
+
+ascii-art.default.color = gradient("sky -> mint")
+message.ai.color        = color("sky")
+message.user.color      = color("mint")
+)
+```
+
+When the plugin is loaded, that theme is registered into `/themes` like any other `.mai` theme.
+
+You can also open a Tk window from a plugin command with `pytknwd(...)`:
+
+```text
+add command("/example-window"){
+    pytknwd(
+root = tk.Tk()
+root.title("Hello")
+tk.Label(root, text="Window from MMD").pack()
+root.mainloop()
+    )
+}
+```
+
+See [`example-mahanai-mahmod.mmd`](example-mahanai-mahmod.mmd) for a full example that includes both features.
 
 ---
 

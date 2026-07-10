@@ -14,6 +14,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -119,6 +120,50 @@ from mahanai.chat_history import (
 # ── Plugin registry ───────────────────────────────────────────────────────────
 _LOADED_PLUGINS: dict[str, MmdPlugin] = {}  # name → MmdPlugin
 _plugin_verifier = PluginVerificationManager()  # Handles signature verification
+_PLUGIN_THEME_SLUGS: dict[str, list[str]] = {}
+
+
+def _materialize_plugin_theme(plugin_name: str, slug: str, source: str) -> Path:
+    safe_plugin = re.sub(r"[^a-zA-Z0-9_.-]+", "-", plugin_name).strip("-") or "plugin"
+    safe_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", slug).strip("-") or "theme"
+    target = Path(tempfile.gettempdir()) / "mahanai-plugin-themes"
+    target.mkdir(parents=True, exist_ok=True)
+    theme_path = target / f"{safe_plugin}--{safe_slug}.mai"
+    theme_path.write_text(source.strip() + "\n", encoding="utf-8")
+    return theme_path
+
+
+def _sync_plugin_themes(plugin: MmdPlugin) -> None:
+    from mahanai.mai_parser import parse_mai_text
+
+    for slug in _PLUGIN_THEME_SLUGS.pop(plugin.name, []):
+        C.unregister_mai_theme(slug)
+
+    slugs: list[str] = []
+    for idx, embedded_theme in enumerate(plugin.default_themes, start=1):
+        parsed = parse_mai_text(embedded_theme.source, name=f"{plugin.name}-theme-{idx}")
+        slug = parsed.slug()
+        display = parsed.display()
+        theme_path = _materialize_plugin_theme(plugin.name, slug, embedded_theme.source)
+        C.register_mai_theme(slug, display, str(theme_path))
+        slugs.append(slug)
+    _PLUGIN_THEME_SLUGS[plugin.name] = slugs
+
+
+def _launch_plugin_tk_window(source: str, workspace: Path) -> None:
+    script = (
+        "import tkinter as tk\n"
+        "from tkinter import *\n"
+        f"workspace = {str(workspace)!r}\n"
+        f"__file__ = {str(workspace / 'plugin-window.py')!r}\n"
+        "\n"
+        f"{source.strip()}\n"
+    )
+    target = Path(tempfile.gettempdir()) / "mahanai-plugin-windows"
+    target.mkdir(parents=True, exist_ok=True)
+    script_path = target / f"window-{uuid.uuid4().hex}.py"
+    script_path.write_text(script, encoding="utf-8")
+    subprocess.Popen([sys.executable, str(script_path)], cwd=str(workspace))
 
 
 def _inject_saved_plugins() -> None:
@@ -128,6 +173,7 @@ def _inject_saved_plugins() -> None:
         try:
             plugin = parse_mmd_file(p)
             _LOADED_PLUGINS[plugin.name] = plugin
+            _sync_plugin_themes(plugin)
         except Exception:
             remove_plugin(name)
 
@@ -2014,6 +2060,15 @@ def main() -> None:
     _register_and_apply_saved_mai_theme()
     _inject_ollama_providers()
     _inject_saved_plugins()
+    _saved_theme_slug = load_theme()
+    if _saved_theme_slug in C.MAI_THEMES:
+        try:
+            from mahanai.mai_parser import parse_mai_file
+
+            C.apply_theme("midnight")
+            C.apply_mai_theme(parse_mai_file(C.MAI_THEMES[_saved_theme_slug]))
+        except Exception:
+            pass
     for _pn, _pd in load_plugins().items():
         _pp = Path(_pd.get("path", ""))
         if _pp.is_file():
@@ -2073,6 +2128,7 @@ def main() -> None:
                 try:
                     _rc_plugin = parse_mmd_file(_rc_mmd_p)
                     _LOADED_PLUGINS[_rc_plugin.name] = _rc_plugin
+                    _sync_plugin_themes(_rc_plugin)
                     print(f"{C.DIM}  .mahanairc: loaded plugin '{_rc_plugin.name}'{C.RST}")
                 except Exception as _rc_pe:
                     print(f"{C.WARN}  .mahanairc: could not load plugin {_rc_mmd_path!r}: {_rc_pe}{C.RST}")
@@ -2582,6 +2638,7 @@ def main() -> None:
                                 if _success and _mmd_path:
                                     _plugin = parse_mmd_file(_mmd_path)
                                     _LOADED_PLUGINS[_plugin.name] = _plugin
+                                    _sync_plugin_themes(_plugin)
                                     save_plugin(_plugin.name, str(_mmd_path), _plugin.codename, _plugin.reg_store, _plugin.reg_name)
                                     get_audit_logger().plugin_loaded(_plugin.name, _plugin.version, "store")
                                     _triggers = ", ".join(_plugin.command_triggers()) or "(none)"
@@ -2644,6 +2701,7 @@ def main() -> None:
                                 if _updated:
                                     _new_plugin = parse_mmd_file(Path(_msg))
                                     _LOADED_PLUGINS[_new_plugin.name] = _new_plugin
+                                    _sync_plugin_themes(_new_plugin)
                                     save_plugin(_new_plugin.name, _msg, _new_plugin.codename, _new_plugin.reg_store, _new_plugin.reg_name)
                                     print(f"  {C.OK}Updated {_pname} → v{_new_plugin.version}{C.RST}")
                                 else:
@@ -2723,6 +2781,7 @@ def main() -> None:
                     # ===== END SECURITY SCAN =====
                     
                     _LOADED_PLUGINS[_plugin.name] = _plugin
+                    _sync_plugin_themes(_plugin)
                     save_plugin(_plugin.name, str(_pp), _plugin.codename, _plugin.reg_store, _plugin.reg_name)
                     _audit.plugin_loaded(_plugin.name, _plugin.version, "local")
                     
@@ -2753,6 +2812,8 @@ def main() -> None:
                     print(f"{C.ERR}Usage: /plugin-unload <name>{C.RST}\n")
                     continue
                 if _pname in _LOADED_PLUGINS:
+                    for _slug in _PLUGIN_THEME_SLUGS.pop(_pname, []):
+                        C.unregister_mai_theme(_slug)
                     del _LOADED_PLUGINS[_pname]
                     remove_plugin(_pname)
                     get_audit_logger().plugin_unloaded(_pname)
@@ -2777,6 +2838,7 @@ def main() -> None:
                         try:
                             _new_pl = parse_mmd_file(_pp_hot)
                             _LOADED_PLUGINS[_new_pl.name] = _new_pl
+                            _sync_plugin_themes(_new_pl)
                             _plugin_mtimes[_pn_hot] = _cur_mtime
                             print(f"{C.DIM}🔌 Plugin '{_new_pl.name}' hot-reloaded.{C.RST}")
                         except Exception:
@@ -2807,6 +2869,12 @@ def main() -> None:
                                         print(out)
                                 except Exception as _se:
                                     print(f"{C.ERR}Plugin shell error: {_se}{C.RST}")
+                            elif _action.type == "tk-window":
+                                try:
+                                    _launch_plugin_tk_window(_action.value, workspace)
+                                    print(f"{C.OK}Plugin window launched.{C.RST}")
+                                except Exception as _se:
+                                    print(f"{C.ERR}Plugin window error: {_se}{C.RST}")
                         break
                 if _plugin_handled:
                     break

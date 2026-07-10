@@ -30,6 +30,7 @@ These activities are flagged but can be approved:
 - User management (`useradd`)
 - System service control (`systemctl`)
 - Plugins from unknown sources (not maifoundation)
+- Tk window actions via `pytknwd(...)` because they execute embedded Python code
 
 ### Loading Plugins Safely
 
@@ -117,6 +118,12 @@ mahanai-signer key rotate
 
 ### 2. Sign Your Plugins Before Distribution
 
+Embedded theme and UI features should be treated explicitly:
+
+- `newdeftheme(...)` should stay limited to `.mai` theme properties and clear metadata.
+- `pytknwd(...)` should stay limited to simple local Tk UI flows that are obvious to the user.
+- If you use embedded Tk code, explain what it does in comments near the command.
+
 ```bash
 # Before uploading to the store:
 mahanai-signer sign my-awesome-plugin.mmd
@@ -154,6 +161,19 @@ plugin.name = "Data Fetcher"
 ...
 ```
 
+If your plugin opens a Tk window, document that too:
+
+```text
+# NOTE: This plugin opens a local Tk window for a user-confirmed form.
+# No network access or background persistence is performed by the UI code.
+
+add command("/settings-window"){
+    pytknwd(
+    ...
+    )
+}
+```
+
 ## Security Event Logging
 
 All plugin security events are logged to: `~/.config/mahanai/plugin-audit.log`
@@ -177,6 +197,14 @@ All plugin security events are logged to: `~/.config/mahanai/plugin-audit.log`
 ### Q: I'm getting warnings for a legitimate network request. What should I do?
 
 A: Document why in your plugin file comments. Users will see your explanation when loading the plugin. They can approve and load it anyway.
+
+### Q: Why does `pytknwd(...)` trigger a warning?
+
+A: `pytknwd(...)` executes embedded Python code to open a local Tk window. That is intentionally warned on because it is more powerful than a plain command redirect. Only load plugins using it if you trust the author and understand the UI code.
+
+### Q: Are `newdeftheme(...)` blocks dangerous?
+
+A: They are lower risk than shell or Python execution because they are parsed as `.mai` theme definitions, but they still come from plugin content. Treat them as trusted-content features rather than as a security boundary.
 
 ### Q: My plugin signature keeps failing verification. Why?
 

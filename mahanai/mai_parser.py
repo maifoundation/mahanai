@@ -154,22 +154,16 @@ _PROPERTY_MAP: dict[str, str] = {
 }
 
 
-def parse_mai_file(path: str | Path) -> MaiTheme:
-    """Parse a .mai file and return a MaiTheme.
-
-    Raises ValueError for empty files or invalid color values.
-    """
-    path = Path(path)
-    text = path.read_text(encoding="utf-8")
-
+def parse_mai_text(text: str, *, name: str = "custom") -> MaiTheme:
+    """Parse raw .mai theme text and return a MaiTheme."""
     content_lines = [
         l.strip() for l in text.splitlines()
         if l.strip() and not l.strip().startswith("#") and not l.strip().startswith("import ")
     ]
     if not content_lines:
-        raise ValueError(f"{path.name!r} is empty — no theme properties found")
+        raise ValueError("theme source is empty — no theme properties found")
 
-    theme = MaiTheme(name=path.stem)
+    theme = MaiTheme(name=name)
     variables: dict[str, str] = {}
 
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
@@ -219,3 +213,13 @@ def parse_mai_file(path: str | Path) -> MaiTheme:
             raise ValueError(f"line {lineno}: {exc}") from exc
 
     return theme
+
+
+def parse_mai_file(path: str | Path) -> MaiTheme:
+    """Parse a .mai file and return a MaiTheme.
+
+    Raises ValueError for empty files or invalid color values.
+    """
+    path = Path(path)
+    text = path.read_text(encoding="utf-8")
+    return parse_mai_text(text, name=path.stem)

@@ -20,6 +20,11 @@ class MmdCommand:
 
 
 @dataclass
+class MmdTheme:
+    source: str
+
+
+@dataclass
 class MmdPlugin:
     name: str
     path: str
@@ -27,6 +32,7 @@ class MmdPlugin:
     codename: str = ""
     reg_store: str = ""
     reg_name: str = ""
+    default_themes: list[MmdTheme] = field(default_factory=list)
     commands: list[MmdCommand] = field(default_factory=list)
 
     def command_triggers(self) -> list[str]:
@@ -39,6 +45,41 @@ def _derive_name(stem: str) -> str:
         if stem.startswith(prefix):
             return stem[len(prefix):]
     return stem
+
+
+def _extract_parenthesized(text: str, start_idx: int) -> tuple[str, int]:
+    """Return the raw content inside balanced parentheses starting at start_idx."""
+    if start_idx >= len(text) or text[start_idx] != "(":
+        raise ValueError("expected '('")
+
+    depth = 0
+    quote = ""
+    escaped = False
+    start_content = start_idx + 1
+
+    for idx in range(start_idx, len(text)):
+        ch = text[idx]
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start_content:idx], idx + 1
+            continue
+
+    raise ValueError("unclosed parenthesized block")
 
 
 def parse_mmd_file(path: str | Path) -> MmdPlugin:
@@ -67,6 +108,12 @@ def parse_mmd_file(path: str | Path) -> MmdPlugin:
     plugin.codename = _str_val(r'^plugin\.codename\s*=\s*(.+)$')
     plugin.reg_store = _str_val(r'^plugin\.reg\.store\s*=\s*(.+)$')
     plugin.reg_name  = _str_val(r'^plugin\.reg\.name\s*=\s*(.+)$')
+
+    theme_pattern = re.compile(r'newdeftheme\s*\(', re.IGNORECASE)
+    for theme_match in theme_pattern.finditer(text):
+        theme_source, _ = _extract_parenthesized(text, theme_match.end() - 1)
+        if theme_source.strip():
+            plugin.default_themes.append(MmdTheme(source=theme_source.strip()))
 
     # Parse: add command("/trigger", ...) { ... }
     # The arg list may contain nested parens like `if fail create(status = 1)`,
@@ -100,6 +147,12 @@ def parse_mmd_file(path: str | Path) -> MmdPlugin:
         sc = re.search(r'shell\s*\(\s*"([^"]*)"\s*\)', body)
         if sc:
             cmd.actions.append(MmdAction(type="shell-cmd", value=sc.group(1)))
+
+        tk_pattern = re.compile(r'pytknwd\s*\(', re.IGNORECASE)
+        for tk_match in tk_pattern.finditer(body):
+            tk_source, _ = _extract_parenthesized(body, tk_match.end() - 1)
+            if tk_source.strip():
+                cmd.actions.append(MmdAction(type="tk-window", value=tk_source.strip()))
 
         plugin.commands.append(cmd)
 

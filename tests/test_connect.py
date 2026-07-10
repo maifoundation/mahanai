@@ -158,10 +158,10 @@ class ConnectCommandTests(unittest.TestCase):
 
         clear_session_grants()
 
-        result = run_user_command(Path("."), {"command": "pwd"}, approve=lambda _summary: "deny")
+        result = run_user_command(Path("."), {"command": "echo hello"}, approve=lambda _summary: "deny")
 
         self.assertEqual(result["error"], "user_denied")
-        self.assertEqual(result["command"], "pwd")
+        self.assertEqual(result["command"], "echo hello")
 
     def test_session_grant_bypasses_reapproval_for_safe_command(self) -> None:
         from mahanai.connect import clear_session_grants, grant_command_session, run_user_command
@@ -175,12 +175,27 @@ class ConnectCommandTests(unittest.TestCase):
 
             result = run_user_command(
                 Path("."),
-                {"command": "pwd"},
+                {"command": "echo hello"},
                 approve=lambda _summary: (_ for _ in ()).throw(AssertionError("approval should not run")),
             )
 
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["stdout"], "ok\n")
+
+    def test_pwd_returns_resolved_cwd_without_shelling_out(self) -> None:
+        from mahanai.connect import clear_session_grants, run_user_command
+
+        clear_session_grants()
+        with patch("mahanai.connect.subprocess.run") as run_mock:
+            result = run_user_command(
+                Path("."),
+                {"command": "pwd", "cwd": "tests"},
+                approve=lambda _summary: (_ for _ in ()).throw(AssertionError("approval should not run")),
+            )
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], f"{Path('tests').resolve()}\n")
+        run_mock.assert_not_called()
 
     def test_high_risk_command_still_requires_per_action_approval(self) -> None:
         from mahanai.connect import clear_session_grants, grant_command_session, run_user_command

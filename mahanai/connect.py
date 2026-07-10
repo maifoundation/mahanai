@@ -250,6 +250,17 @@ def run_user_command(
     timeout = max(1, int(args.get("timeout_seconds") or 120))
     high_risk = _is_high_risk(command)
 
+    if command.lower() == "pwd":
+        return {
+            "exit_code": 0,
+            "stdout": f"{cwd}\n",
+            "stderr": "",
+            "output": f"{cwd}\n",
+            "command": command,
+            "cwd": str(cwd),
+            "high_risk": False,
+        }
+
     if high_risk or not _SESSION_GRANTS["command_session_granted"]:
         decision = approve(
             {

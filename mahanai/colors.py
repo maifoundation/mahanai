@@ -167,6 +167,14 @@ def register_mai_theme(slug: str, display: str, path: str) -> None:
     MAI_THEMES[slug] = path
 
 
+def unregister_mai_theme(slug: str) -> None:
+    """Remove one registered .mai theme from the in-memory theme tables."""
+    if slug in THEME_NAMES:
+        THEME_NAMES.remove(slug)
+    THEME_DISPLAY.pop(slug, None)
+    MAI_THEMES.pop(slug, None)
+
+
 def unregister_all_mai_themes() -> None:
     """Remove every .mai theme from the in-memory theme tables."""
     global MAI_THEMES

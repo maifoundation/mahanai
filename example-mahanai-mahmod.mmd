@@ -6,9 +6,23 @@ plugin.codename = "maifoundation.example.mahmod"
 plugin.reg.store = "mai-foundation"
 plugin.reg.name = "MahanAI Foundation"
 
-# add a reciver to add the command /compact
+# embed a default .mai theme directly in the plugin
+newdeftheme(
+theme.name = example-neon
+theme.pretty.name = Example Neon
+
+sky = #5B8DEF
+mint = #34D399
+
+ascii-art.default.color = gradient("sky -> mint")
+message.ai.color        = color("sky")
+message.user.color      = color("mint")
+message.ai.name         = text("Example Bot")
+)
+
+# add a receiver to add the command /compact
 add command("/compact",if fail create(status = 1)){
-	# iimporting provider features from pvd
+	# importing provider features from pvd
 	import provider-features from pvd
 	# using claude code's /compact for mine
 	pvd(claude-code)[
@@ -16,6 +30,34 @@ add command("/compact",if fail create(status = 1)){
 	]
 }
 
-# end with sucses
+# open a Tk window from a plugin command
+add command("/example-window",if fail create(status = 1)){
+	pytknwd(
+root = tk.Tk()
+root.title("MahanAI Example Window")
+root.geometry("420x220")
+
+frame = tk.Frame(root, padx=20, pady=20)
+frame.pack(fill="both", expand=True)
+
+title = tk.Label(frame, text="Hello from Example MahMod", font=("Segoe UI", 16, "bold"))
+title.pack(pady=(0, 12))
+
+body = tk.Label(
+    frame,
+    text="This window was launched from an .mmd trigger using pytknwd(...).",
+    wraplength=340,
+    justify="center",
+)
+body.pack(pady=(0, 14))
+
+close_btn = tk.Button(frame, text="Close", command=root.destroy)
+close_btn.pack()
+
+root.mainloop()
+	)
+}
+
+# end with success
 end-script(status)
 
