@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime
 import getpass
 import hashlib
+import io
 import json
 import os
 import re
@@ -488,6 +490,17 @@ def _streaming_enabled() -> bool:
 
 
 def _stream_direct(api_key: str, messages: list[dict[str, Any]], model: str, base_url: str) -> str:
+    return _stream_direct_to(api_key, messages, model, base_url, stdout=sys.stdout)
+
+
+def _stream_direct_to(
+    api_key: str,
+    messages: list[dict[str, Any]],
+    model: str,
+    base_url: str,
+    *,
+    stdout: Any,
+) -> str:
     content_parts: list[str] = []
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
@@ -511,7 +524,7 @@ def _stream_direct(api_key: str, messages: list[dict[str, Any]], model: str, bas
                     chunk = json.loads(line)
                     delta = chunk["choices"][0]["delta"].get("content", "")
                     if delta:
-                        print(delta, end="", flush=True)
+                        print(delta, end="", flush=True, file=stdout)
                         content_parts.append(delta)
                 except Exception:
                     continue
@@ -520,6 +533,17 @@ def _stream_direct(api_key: str, messages: list[dict[str, Any]], model: str, bas
 
 
 def _fetch_direct(api_key: str, messages: list[dict[str, Any]], model: str, base_url: str) -> str:
+    return _fetch_direct_to(api_key, messages, model, base_url, stdout=sys.stdout)
+
+
+def _fetch_direct_to(
+    api_key: str,
+    messages: list[dict[str, Any]],
+    model: str,
+    base_url: str,
+    *,
+    stdout: Any,
+) -> str:
     """Non-streaming fetch directly from the server via httpx."""
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
@@ -532,7 +556,7 @@ def _fetch_direct(api_key: str, messages: list[dict[str, Any]], model: str, base
         response.raise_for_status()
         result = response.json()
         content = result["choices"][0]["message"]["content"]
-        print(content, end="", flush=True)
+        print(content, end="", flush=True, file=stdout)
         return content
 
 
@@ -771,7 +795,14 @@ _EFFORT_CODEX: dict[str, str] = {
 }
 
 
-def _run_claude_cli(prompt: str, model: str | None = None, effort_instruction: str = "") -> str:
+def _run_claude_cli(
+    prompt: str,
+    model: str | None = None,
+    effort_instruction: str = "",
+    *,
+    stdout: Any = sys.stdout,
+    stderr: Any = sys.stderr,
+) -> str:
     """Stream a prompt to the Claude CLI via stream-json events. Returns full response text."""
     full_prompt = f"{effort_instruction}\n\n{prompt}".strip() if effort_instruction else prompt
     cmd = _resolve_cli("claude") + [
@@ -808,12 +839,12 @@ def _run_claude_cli(prompt: str, model: str | None = None, effort_instruction: s
                     if isinstance(delta, dict) and delta.get("type") == "text_delta":
                         text = delta.get("text", "")
                         if text:
-                            print(text, end="", flush=True)
+                            print(text, end="", flush=True, file=stdout)
                             parts.append(text)
                 elif etype == "text":
                     text = event.get("text", "")
                     if text:
-                        print(text, end="", flush=True)
+                        print(text, end="", flush=True, file=stdout)
                         parts.append(text)
                 elif etype == "assistant":
                     message = event.get("message", {})
@@ -821,7 +852,7 @@ def _run_claude_cli(prompt: str, model: str | None = None, effort_instruction: s
                         if isinstance(block, dict) and block.get("type") == "text":
                             text = block.get("text", "")
                             if text:
-                                print(text, end="", flush=True)
+                                print(text, end="", flush=True, file=stdout)
                                 parts.append(text)
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -829,9 +860,9 @@ def _run_claude_cli(prompt: str, model: str | None = None, effort_instruction: s
         if proc.returncode != 0:
             err = proc.stderr.read().strip()
             if err:
-                print(f"\n{C.ERR}[Claude CLI error]{C.RST} {err}")
+                print(f"[Claude CLI error] {err}", file=stderr)
     except FileNotFoundError:
-        print(f"{C.ERR}[Claude CLI not found] Make sure 'claude' is installed and on your PATH.{C.RST}")
+        print("[Claude CLI not found] Make sure 'claude' is installed and on your PATH.", file=stderr)
     return "".join(parts)
 
 
@@ -1011,6 +1042,7 @@ def _stream_wham(
     model: str,
     reasoning_effort: str = "medium",
     workspace: Path | None = None,
+    stdout: Any = sys.stdout,
 ) -> str:
     """Stream a response from the WHAM (ChatGPT backend) Responses API with tool-call support."""
     ws = workspace or Path.cwd()
@@ -1089,7 +1121,7 @@ def _stream_wham(
                             raw_delta = chunk.get("delta", "")
                             delta_text = raw_delta if isinstance(raw_delta, str) else raw_delta.get("text", "")
                             if delta_text:
-                                print(delta_text, end="", flush=True)
+                                print(delta_text, end="", flush=True, file=stdout)
                                 parts.append(delta_text)
 
                         elif ctype == "response.output_item.added":
@@ -1113,7 +1145,7 @@ def _stream_wham(
                         elif chunk.get("choices"):
                             delta_text = chunk["choices"][0].get("delta", {}).get("content", "") or ""
                             if delta_text:
-                                print(delta_text, end="", flush=True)
+                                print(delta_text, end="", flush=True, file=stdout)
                                 parts.append(delta_text)
                     except Exception:
                         continue
@@ -1177,11 +1209,12 @@ def _codex_indirect_backend_model(model_name: str) -> str:
     return model_name
 
 
-def _run_codex_cli(prompt: str, model: str | None = None) -> None:
+def _run_codex_cli(prompt: str, model: str | None = None, *, stdout: Any = sys.stdout, stderr: Any = sys.stderr) -> str:
     """Run Codex CLI as a subprocess (indirect fallback when no local token found)."""
     cmd = ["codex", "-q", prompt]
     if model:
         cmd += ["--model", model]
+    parts: list[str] = []
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1192,10 +1225,12 @@ def _run_codex_cli(prompt: str, model: str | None = None) -> None:
             errors="replace",
         )
         for line in proc.stdout:
-            print(line, end="", flush=True)
+            print(line, end="", flush=True, file=stdout)
+            parts.append(line)
         proc.wait()
     except FileNotFoundError:
-        print(f"{C.ERR}[Codex CLI not found] Install it with: npm i -g @openai/codex{C.RST}\n")
+        print("[Codex CLI not found] Install it with: npm i -g @openai/codex", file=stderr)
+    return "".join(parts)
 
 
 def _model_selector(current_idx: int) -> int:
@@ -1308,6 +1343,187 @@ def run_turn(
     print(limit_msg, end="", flush=True)
     return limit_msg
 
+
+def _api_mode_prompt(query: str, *, small: bool) -> str:
+    if not small:
+        return query
+    return f"Keep the answer very short and direct.\n\n{query}"
+
+
+def _run_api_request(
+    *,
+    prompt: str,
+    selected: dict[str, Any],
+    workspace: Path,
+    stream: bool,
+    stdout: Any,
+    stderr: Any,
+) -> str:
+    output_target = stdout if stream else io.StringIO()
+    mode = selected["mode"]
+    if mode == "claude":
+        return _run_claude_cli(
+            prompt,
+            model=selected.get("claude_model"),
+            stdout=output_target,
+            stderr=stderr,
+        )
+
+    messages = [{"role": "user", "content": prompt}]
+
+    if mode == "codex_direct":
+        creds = _get_codex_direct_token()
+        if not creds:
+            raise RuntimeError("Not signed in to OpenAI. Run /codex-login first.")
+        codex_access, codex_account_id = creds
+        return _stream_wham(
+            codex_access,
+            codex_account_id,
+            messages,
+            selected["name"],
+            "medium",
+            workspace,
+            stdout=output_target,
+        )
+
+    if mode == "codex_indirect":
+        backend_model = _codex_indirect_backend_model(selected["name"])
+        indirect_token = _load_codex_indirect_key()
+        if indirect_token:
+            return _stream_wham(
+                indirect_token,
+                None,
+                messages,
+                backend_model,
+                "medium",
+                workspace,
+                stdout=output_target,
+            )
+        return _run_codex_cli(prompt, model=backend_model, stdout=output_target, stderr=stderr)
+
+    if mode == "ollama":
+        if stream:
+            return _stream_direct_to(
+                selected.get("ollama_api_key") or _OLLAMA_DEFAULT_API_KEY,
+                messages,
+                selected["name"],
+                selected["ollama_url"],
+                stdout=output_target,
+            )
+        return _fetch_direct_to(
+            selected.get("ollama_api_key") or _OLLAMA_DEFAULT_API_KEY,
+            messages,
+            selected["name"],
+            selected["ollama_url"],
+            stdout=output_target,
+        )
+
+    if mode == "custom":
+        custom_cfg = load_custom_endpoint()
+        if not custom_cfg:
+            raise RuntimeError("No custom endpoint configured. Use /custom to set one.")
+        if stream:
+            return _stream_direct_to(
+                custom_cfg["api_key"] or "none",
+                messages,
+                custom_cfg["model"],
+                custom_cfg["url"],
+                stdout=output_target,
+            )
+        return _fetch_direct_to(
+            custom_cfg["api_key"] or "none",
+            messages,
+            custom_cfg["model"],
+            custom_cfg["url"],
+            stdout=output_target,
+        )
+
+    if mode == "nvidia_direct":
+        nvidia_api_key = load_nvidia_api_key()
+        if not nvidia_api_key:
+            raise RuntimeError("NVIDIA direct mode needs an API key. Use /api-key-nvidia.")
+        if stream:
+            return _stream_direct_to(
+                nvidia_api_key,
+                messages,
+                selected["name"],
+                NVIDIA_DIRECT_URL,
+                stdout=output_target,
+            )
+        return _fetch_direct_to(
+            nvidia_api_key,
+            messages,
+            selected["name"],
+            NVIDIA_DIRECT_URL,
+            stdout=output_target,
+        )
+
+    api_key = resolve_api_key()
+    if not api_key:
+        raise RuntimeError("Set an API key first with /api-key.")
+    if stream:
+        return _stream_direct_to(
+            api_key,
+            messages,
+            selected["name"],
+            NVIDIA_BASE_URL,
+            stdout=output_target,
+        )
+    return _fetch_direct_to(
+        api_key,
+        messages,
+        selected["name"],
+        NVIDIA_BASE_URL,
+        stdout=output_target,
+    )
+
+
+def _run_api_mode(
+    *,
+    model_name: str | None,
+    query: str | None,
+    small: bool,
+    stream: bool,
+    workspace: Path,
+    stdout: Any,
+    stderr: Any,
+) -> int:
+    if not model_name:
+        print("The -api mode requires --model.", file=stderr)
+        return 2
+    if not query:
+        print("The -api mode requires --qua.", file=stderr)
+        return 2
+
+    idx = _model_index_for_name(model_name)
+    if idx is None:
+        print(f"Unknown model: {model_name}", file=stderr)
+        return 2
+
+    selected = AVAILABLE_MODELS[idx]
+    prompt = _api_mode_prompt(query, small=small)
+
+    try:
+        with contextlib.redirect_stdout(stdout):
+            reply = _run_api_request(
+                prompt=prompt,
+                selected=selected,
+                workspace=workspace,
+                stream=stream,
+                stdout=stdout,
+                stderr=stderr,
+            )
+    except (httpx.HTTPStatusError, httpx.RequestError, APIStatusError) as exc:
+        print(str(exc), file=stderr)
+        return 1
+    except Exception as exc:
+        print(str(exc), file=stderr)
+        return 1
+
+    if not stream:
+        stdout.write(reply)
+        stdout.flush()
+    return 0
 
 
 _SPECIAL_FILE_EMOJIS: dict[str, str] = {
@@ -1921,6 +2137,7 @@ def _print_help(term: str = "") -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="mahanai", add_help=False)
+    parser.add_argument("-api", dest="api_mode", action="store_true", help="Run one non-interactive API request and print only the answer")
     parser.add_argument("--compact", action="store_true", help="Compact mode: smaller MAI banner and shorter header")
     parser.add_argument("--server",  action="store_true", help="Start the gateway server instead of the chat loop")
     parser.add_argument("--port",    type=int, default=8080, metavar="PORT", help="Gateway server port (default: 8080)")
@@ -1928,10 +2145,30 @@ def main() -> None:
                         help="Gateway API type: openai (default) or anthropic")
     parser.add_argument("--api-key", dest="cli_api_key", default=None, metavar="KEY",
                         help="API key for Anthropic or the MahanAI server (overrides saved key)")
+    parser.add_argument("--model", dest="api_model", default=None, metavar="MODEL",
+                        help="Model id for -api mode")
+    parser.add_argument("--qua", dest="api_query", default=None, metavar="QUERY",
+                        help="Prompt text for -api mode")
+    parser.add_argument("--small", dest="api_small", action="store_true",
+                        help="Ask for a very short answer in -api mode")
+    parser.add_argument("--stream", dest="api_stream", action="store_true",
+                        help="Stream the answer in -api mode")
     args, _ = parser.parse_known_args()
     compact = args.compact
 
     workspace = Path.cwd()
+    if args.api_mode:
+        raise SystemExit(
+            _run_api_mode(
+                model_name=args.api_model,
+                query=args.api_query,
+                small=args.api_small,
+                stream=args.api_stream,
+                workspace=workspace,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+        )
     api_key = resolve_api_key()
     nvidia_api_key = load_nvidia_api_key()
 
