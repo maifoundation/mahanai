@@ -2,7 +2,7 @@
 
 <img width="700" height="300" alt="(M MahanAI)" src="https://github.com/user-attachments/assets/fc20edd6-601f-4740-9ac2-e2db61c8f49f" />
 
-# MahanAI Max 3.0
+# MahanAI
 
 **A terminal AI agent with a plugin ecosystem, gateway server, and full multi-model support.**
 
