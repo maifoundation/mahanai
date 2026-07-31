@@ -2,7 +2,7 @@
 
 <img width="700" height="300" alt="(M MahanAI)" src="https://github.com/user-attachments/assets/fc20edd6-601f-4740-9ac2-e2db61c8f49f" />
 
-# MahanAI
+# MahanAI Max 3.0
 
 **A terminal AI agent with a plugin ecosystem, gateway server, and full multi-model support.**
 
@@ -24,6 +24,15 @@
 MahanAI is a terminal AI agent you install with pip. It gives you a powerful chat interface, agentic tool use (run commands, read/write files, search the web), and a **local gateway server** that makes all your configured AI providers available as a single unified API endpoint — so any tool that speaks OpenAI or Anthropic format can point at it.
 
 On top of that: a **plugin system** (`.mmd` files) with a GitHub-backed store, **custom themes** (`.mai` files), conversation branching, effort levels, plan mode, and 60+ slash commands.
+
+### New in Max 3.0
+
+- **Modern terminal composer** — a three-line input bar, cyan prompt marker, and a clean model/effort/workspace status line
+- **Clipboard image input** — paste multiple images directly into the prompt; image tokens can be removed with one Backspace
+- **Compact GitHub repository tokens** — pasted repository references render as `◉ owner/repo`, remain atomic while editing, and send the original URL to the model
+- **Persistent default model** — `/set-def-model` opens the model selector and saves the choice for future sessions
+- **Expanded OpenAI models** — GPT-5.5 plus GPT-5.6 Sol, Terra, and Luna in Direct and Indirect modes
+- **Improved Codex login** — successful browser authentication opens the bundled MahanAI confirmation page
 
 ---
 
@@ -58,6 +67,8 @@ On macOS, you can also double-click `scripts/get-started.command` from Finder.
 - **Plugin store** — install community `.mmd` plugins with `/store install`, publish your own with `/store upload`
 - **Custom themes** — write `.mai` theme files with gradients, color aliases, and display name overrides
 - **Multi-model** — Claude (via Claude Code), NVIDIA NIM, OpenAI Codex, Ollama, and any OpenAI-compatible endpoint
+- **Multimodal prompts** — paste multiple clipboard images alongside text in the terminal composer
+- **Repository-aware input** — GitHub links collapse into editable `◉ owner/repo` tokens without changing what the model receives
 - **Agentic tools** — shell commands, file read/write/edit, web search, Python REPL, URL fetch — all with approval prompts and inline diffs
 - **Interact mode** — enable once with `/interact` to let MahanAI control your computer with screenshots, mouse, and keyboard; Wayland helpers are used first, with X11 as a fallback; remove it later with `/interact remove`
 - **Plan mode & effort levels** — `/plan on` to outline before acting; `/effort high` for deeper reasoning
@@ -79,7 +90,7 @@ mahanai --server --type anthropic         # Anthropic-compatible
 mahanai --server --port 9000 --api-key sk-gaming
 ```
 
-Point any OpenAI-compatible client at `http://localhost:8080` and use model IDs like `claude-sonnet-4-6`, `meta/llama-3.3-70b-instruct`, `gpt-5.4-indirect`, or your Ollama model name — MahanAI routes and converts formats automatically, including SSE streaming end-to-end.
+Point any OpenAI-compatible client at `http://localhost:8080` and use model IDs like `claude-sonnet-4-6`, `meta/llama-3.3-70b-instruct`, `gpt-5.6-sol-indirect`, `gpt-5.6-terra-indirect`, `gpt-5.6-luna-indirect`, or your Ollama model name — MahanAI routes and converts formats automatically, including SSE streaming end-to-end.
 
 A browser-based chat UI is also available at `http://localhost:8080` when the server is running.
 
@@ -93,7 +104,7 @@ Switch models interactively with `/models` or quick-switch with `/mode claude` /
 |---|---|
 | **Claude** (Opus, Sonnet, Haiku) | Install [Claude Code](https://claude.ai/code) and sign in |
 | **NVIDIA NIM** (Llama 3.3 70B) | `/api-key-nvidia your-key` |
-| **OpenAI Codex** | `/codex-login` (browser OAuth, no API key needed) |
+| **OpenAI Codex** (GPT-5.5; GPT-5.6 Sol, Terra, Luna; earlier GPT-5 models) | `/codex-login` (browser OAuth, no API key needed) |
 | **GitHub plugin store** | `/store login` (OAuth when configured, PAT fallback otherwise) |
 | **Ollama** | `/add-ollama name localhost 11434` |
 | **Any OpenAI-compatible API** | `/custom http://your-server/v1 model-name` |
@@ -211,6 +222,7 @@ load(python-dev-kit)
 | Command | Description |
 |---|---|
 | `/models` | Interactive model picker |
+| `/set-def-model` | Select and persist the default model for future sessions |
 | `/effort <low\|medium\|high\|very-high>` | Set reasoning depth |
 | `/plan on\|off` | Outline approach before every response |
 | `/auto on\|off` | Autonomous mode (skip approval prompts) |

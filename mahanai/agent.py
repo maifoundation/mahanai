@@ -28,6 +28,15 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 from openai import APIStatusError, OpenAI
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.formatted_text import fragment_list_to_text
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.styles import Style
 
 from mahanai import __version__, colors as C
 from mahanai.config import (
@@ -98,6 +107,25 @@ from mahanai.plugin_security import scan_plugin_security, format_security_report
 from mahanai.plugin_signer import PluginVerificationManager
 from mahanai.plugin_audit import get_audit_logger
 from mahanai.rc_parser import parse_rc_file
+
+
+_CODEX_LOGIN_SUCCESS_PATH = Path(__file__).parent.parent / "logedin.html"
+_CODEX_LOGIN_ICON_PATH = Path(__file__).parent.parent / "icons" / "icon.png"
+try:
+    _CODEX_LOGIN_SUCCESS_HTML_BYTES = _CODEX_LOGIN_SUCCESS_PATH.read_bytes()
+    _codex_login_icon_data_url = (
+        b"data:image/png;base64," + base64.b64encode(_CODEX_LOGIN_ICON_PATH.read_bytes())
+    )
+    _CODEX_LOGIN_SUCCESS_HTML_BYTES = _CODEX_LOGIN_SUCCESS_HTML_BYTES.replace(
+        b"./icons/icon.png", _codex_login_icon_data_url
+    )
+except OSError:
+    _CODEX_LOGIN_SUCCESS_HTML_BYTES = b"<html><body><h2>Signed in. You can close this tab.</h2></body></html>"
+
+
+def _codex_login_success_bytes() -> bytes:
+    """Return the bundled page shown after a successful Codex login."""
+    return _CODEX_LOGIN_SUCCESS_HTML_BYTES
 from mahanai.system_info import describe_runtime
 from mahanai.tools import get_tools, batch_approve_and_execute, execute_tool, normalize_tool_arguments_json, set_autonomous_mode, is_autonomous_mode
 from mahanai.chat_history import (
@@ -360,6 +388,10 @@ AVAILABLE_MODELS: list[dict] = [
     {"label": "Claude Sonnet 4.6",     "name": "claude-sonnet-4-6",          "note": "sonnet",   "group": "Claude",               "mode": "claude", "claude_model": "claude-sonnet-4-6"},
     {"label": "Claude Haiku 4.5",      "name": "claude-haiku-4-5-20251001",  "note": "haiku",    "group": "Claude",               "mode": "claude", "claude_model": "claude-haiku-4-5-20251001"},
 
+    {"label": "GPT-5.6 Sol",           "name": "gpt-5.6-sol",                "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.6 Terra",         "name": "gpt-5.6-terra",              "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.6 Luna",          "name": "gpt-5.6-luna",               "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.5",               "name": "gpt-5.5",                    "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.4",               "name": "gpt-5.4",                    "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.2-Codex",         "name": "gpt-5.2-codex",              "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.1-Codex-Max",     "name": "gpt-5.1-codex-max",          "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
@@ -367,6 +399,10 @@ AVAILABLE_MODELS: list[dict] = [
     {"label": "GPT-5.3-Codex",         "name": "gpt-5.3-codex",              "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.2",               "name": "gpt-5.2",                    "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
     {"label": "GPT-5.1-Codex-Mini",    "name": "gpt-5.1-codex-mini",         "note": "direct",   "group": "OpenAI Codex (Direct)",  "mode": "codex_direct"},
+    {"label": "GPT-5.6 Sol",           "name": "gpt-5.6-sol-indirect",       "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.6 Terra",         "name": "gpt-5.6-terra-indirect",     "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.6 Luna",          "name": "gpt-5.6-luna-indirect",      "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
+    {"label": "GPT-5.5",               "name": "gpt-5.5-indirect",           "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
     {"label": "GPT-5.4",               "name": "gpt-5.4-indirect",           "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
     {"label": "GPT-5.2-Codex",         "name": "gpt-5.2-codex-indirect",     "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
     {"label": "GPT-5.1-Codex-Max",     "name": "gpt-5.1-codex-max-indirect", "note": "indirect", "group": "OpenAI Codex (Indirect)","mode": "codex_indirect"},
@@ -431,6 +467,57 @@ from rich.text import Text
 console = Console()
 
 
+def _clipboard_image_warning() -> str | None:
+    """Return the Linux clipboard-image dependency warning, when needed."""
+    if sys.platform.startswith("linux") and not (
+        shutil.which("wl-paste") or shutil.which("xclip")
+    ):
+        return "⚠ Clipboard image paste needs wl-paste or xclip"
+    return None
+
+
+def _capture_clipboard_image() -> dict[str, str] | None:
+    """Read a clipboard bitmap and encode it as a portable PNG data URL."""
+    from PIL import Image, ImageGrab
+
+    try:
+        clipboard = ImageGrab.grabclipboard()
+        image = clipboard if isinstance(clipboard, Image.Image) else None
+        if image is None and isinstance(clipboard, list):
+            for candidate in clipboard:
+                try:
+                    with Image.open(candidate) as opened:
+                        image = opened.copy()
+                    break
+                except (OSError, ValueError):
+                    continue
+        if image is None:
+            return None
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return {
+            "type": "image",
+            "name": "clipboard.png",
+            "url": f"data:image/png;base64,{encoded}",
+        }
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _user_content_with_images(text: str, images: list[dict[str, str]]) -> Any:
+    """Build ordered multimodal content while preserving plain-text turns."""
+    if not images:
+        return text
+    return [
+        *(
+            {"type": "image_url", "image_url": {"url": image["url"]}}
+            for image in images
+        ),
+        {"type": "text", "text": text},
+    ]
+
+
 def _gradient_line(text, colors):
     styled = Text()
     length = len(text)
@@ -441,6 +528,15 @@ def _gradient_line(text, colors):
         idx = int(i / max(1, length - 1) * (len(colors) - 1))
         styled.append(char, style=colors[idx])
     return styled
+
+
+def _banner_metadata_line(model_label: str, width: int) -> str:
+    """Fill a banner row with balanced padding around its separator."""
+    version = "Max 3.0"
+    padding = max(2, width - len(version) - 1 - len(model_label))
+    left_padding = padding // 2
+    right_padding = padding - left_padding
+    return f"{version}{' ' * left_padding}|{' ' * right_padding}{model_label}"
 
 
 def print_startup_banner(model_label: str = "MahanAI Super", compact: bool = False):
@@ -458,8 +554,9 @@ def print_startup_banner(model_label: str = "MahanAI Super", compact: bool = Fal
         for line in mai_banner:
             console.print(_gradient_line(line, colors))
         console.print("=" * 35)
-        console.print(f"[bold]  Max 2.0  |  {model_label}  |[/bold]")
-        console.print("[cyan]  /help  /exit  /quit[/cyan]")
+        console.print(f"[bold]{_banner_metadata_line(model_label, 35)}[/bold]")
+        if clipboard_warning := _clipboard_image_warning():
+            console.print(f"[yellow]{clipboard_warning}[/yellow]")
         console.print("=" * 35)
     else:
         console.print("=" * 64)
@@ -474,13 +571,9 @@ def print_startup_banner(model_label: str = "MahanAI Super", compact: bool = Fal
         for line in banner:
             console.print(_gradient_line(line, colors))
         console.print("\n" + "=" * 64)
-        console.print(f"[bold]  Max 2.0  |  {model_label}  |  /api-key to save key (persists)[/bold]")
-        _streaming = os.environ.get("MAHANAI_STREAM", "1").strip().lower() not in ("0", "false", "no", "off")
-        if _streaming:
-            console.print("[dim]  Replies stream live (MAHANAI_STREAM=0 to wait for full text)[/dim]")
-        else:
-            console.print("[dim]  Replies wait for full response (MAHANAI_STREAM=1 to stream)[/dim]")
-        console.print("[cyan]  /help  /exit  /quit[/cyan]")
+        console.print(f"[bold]{_banner_metadata_line(model_label, 64)}[/bold]")
+        if clipboard_warning := _clipboard_image_warning():
+            console.print(f"[yellow]{clipboard_warning}[/yellow]")
         console.print("=" * 64)
 
 
@@ -570,16 +663,16 @@ def _resolve_cli(name: str) -> list[str]:
 
 
 _CLAUDE_IDENTITY = (
-    "You are MahanAI, a capable coding and system assistant (Max 2.0). "
+    "You are MahanAI, a capable coding and system assistant (Max 3.0). "
     "Do not refer to yourself as Claude or Claude Code — you are MahanAI. "
-    "Max 2.0 is the codename for this release of MahanAI."
+    "Max 3.0 is the codename for this release of MahanAI."
 )
 
 _BUILT_IN_ROLES: dict[str, str] = {
-    "coder":    "You are MahanAI (Max 2.0), a senior software engineer. Write clean, idiomatic code with no unnecessary comments. Use tools proactively and execute immediately.",
-    "writer":   "You are MahanAI (Max 2.0), a skilled technical writer. Write clear, concise prose. Prefer active voice and short sentences.",
-    "analyst":  "You are MahanAI (Max 2.0), a data analyst. Be precise, cite evidence, and prefer structured output (tables, bullet points, numbered lists).",
-    "sysadmin": "You are MahanAI (Max 2.0), a Linux sysadmin. Be terse and direct. Prefer one-liners and pipeline commands.",
+    "coder":    "You are MahanAI (Max 3.0), a senior software engineer. Write clean, idiomatic code with no unnecessary comments. Use tools proactively and execute immediately.",
+    "writer":   "You are MahanAI (Max 3.0), a skilled technical writer. Write clear, concise prose. Prefer active voice and short sentences.",
+    "analyst":  "You are MahanAI (Max 3.0), a data analyst. Be precise, cite evidence, and prefer structured output (tables, bullet points, numbered lists).",
+    "sysadmin": "You are MahanAI (Max 3.0), a Linux sysadmin. Be terse and direct. Prefer one-liners and pipeline commands.",
 }
 
 _EFFORT_INSTRUCTIONS: dict[str, str] = {
@@ -619,6 +712,7 @@ _ALL_COMMANDS: list[tuple[str, str]] = [
     ("/codex-login",      "Sign in to OpenAI (Codex Direct)"),
     ("/codex-logout",     "Remove OpenAI credentials"),
     ("/models",           "Interactive model selector (↑↓ arrows)"),
+    ("/set-def-model",    "Set the model used by future sessions"),
     ("/mode",             "Quick-switch mode: claude, default"),
     ("/model-info",       "Show current model, provider, effort, cost"),
     ("/effort",           "Set reasoning effort: low, medium, high, very-high"),
@@ -662,6 +756,7 @@ _ALL_COMMANDS: list[tuple[str, str]] = [
     ("/role",             "Manage AI personas: save, load, list, remove"),
     ("/macro",            "Record/replay command macros"),
     ("/attach",           "Attach a file or image to the next message"),
+    ("/paste-image",      "Attach an image from the system clipboard"),
     ("/repl",             "Open an interactive Python REPL"),
     ("/audit",            "View tool execution audit log"),
     ("/voice",            "Toggle voice input: on|off"),
@@ -697,6 +792,340 @@ _ALL_COMMANDS: list[tuple[str, str]] = [
 
 _SLASH_COMPLETIONS: list[str] = [c for c, _ in _ALL_COMMANDS]
 
+_GITHUB_REPOSITORY_RE = re.compile(
+    r"(?<![\w./:@-])"
+    r"(?:(?:https://)?github\.com/)?"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+    r"/"
+    r"(?P<repo>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?)"
+    r"(?![\w./-])",
+    re.IGNORECASE,
+)
+_CLIPBOARD_IMAGE_TOKEN_RE = re.compile(r"\[\[mahanai-image:(?P<id>[0-9a-f]+)\]\]")
+_ACTIVE_CLIPBOARD_IMAGES: dict[str, dict[str, str]] = {}
+
+
+def _insert_clipboard_image_token(buffer: Any, image: dict[str, str]) -> str:
+    """Store a clipboard image and insert its internal prompt marker."""
+    image_id = uuid.uuid4().hex
+    record = dict(image)
+    retained_numbers = [
+        int(existing["label"].rsplit(" ", 1)[-1])
+        for existing in _ACTIVE_CLIPBOARD_IMAGES.values()
+        if existing.get("label", "").rsplit(" ", 1)[-1].isdigit()
+    ]
+    record["label"] = f"Image {max(retained_numbers, default=0) + 1}"
+    _ACTIVE_CLIPBOARD_IMAGES[image_id] = record
+    marker = f"[[mahanai-image:{image_id}]]"
+    buffer.insert_text((" " if buffer.text else "") + marker)
+    return marker
+
+
+def _render_clipboard_image_tokens(text: str) -> str:
+    """Render internal image markers as compact prompt tokens."""
+    def _label(match: re.Match[str]) -> str:
+        image = _ACTIVE_CLIPBOARD_IMAGES.get(match.group("id"))
+        return f"▣ {image['label']}" if image else ""
+
+    return _CLIPBOARD_IMAGE_TOKEN_RE.sub(_label, text).rstrip()
+
+
+def _extract_clipboard_images(text: str) -> tuple[str, list[dict[str, str]]]:
+    """Remove prompt markers and return their images in source order."""
+    images = [
+        _ACTIVE_CLIPBOARD_IMAGES[match.group("id")]
+        for match in _CLIPBOARD_IMAGE_TOKEN_RE.finditer(text)
+        if match.group("id") in _ACTIVE_CLIPBOARD_IMAGES
+    ]
+    clean = re.sub(r" ?\[\[mahanai-image:[0-9a-f]+\]\]", "", text).strip()
+    return clean, images
+
+
+def _delete_clipboard_image_before_cursor(buffer: Any) -> bool:
+    """Delete one complete clipboard-image marker ending at the cursor."""
+    cursor = buffer.cursor_position
+    for match in _CLIPBOARD_IMAGE_TOKEN_RE.finditer(buffer.text):
+        if match.end() == cursor:
+            start = match.start()
+            if start > 0 and buffer.text[start - 1] == " ":
+                start -= 1
+            buffer.delete_before_cursor(count=cursor - start)
+            if start == 0 and buffer.text.startswith(" "):
+                buffer.delete(count=1)
+            _ACTIVE_CLIPBOARD_IMAGES.pop(match.group("id"), None)
+            return True
+    return False
+
+
+def _move_across_clipboard_image(buffer: Any, *, direction: int) -> bool:
+    """Move across an image marker as one atomic token."""
+    cursor = buffer.cursor_position
+    for match in _CLIPBOARD_IMAGE_TOKEN_RE.finditer(buffer.text):
+        if direction < 0 and match.end() == cursor:
+            buffer.cursor_position = match.start()
+            return True
+        if direction > 0 and match.start() == cursor:
+            buffer.cursor_position = match.end()
+            return True
+    return False
+
+
+def _paste_clipboard_image_into_buffer(buffer: Any) -> bool:
+    """Capture and insert one clipboard image into an editable buffer."""
+    image = _capture_clipboard_image()
+    if image is None:
+        return False
+    _insert_clipboard_image_token(buffer, image)
+    return True
+
+
+def _github_repository_matches(text: str) -> list[re.Match[str]]:
+    """Return GitHub repository references that can be rendered as tokens."""
+    return list(_GITHUB_REPOSITORY_RE.finditer(text))
+
+
+def _render_github_repositories(text: str) -> str:
+    """Render repository references without changing their source text."""
+    return _GITHUB_REPOSITORY_RE.sub(
+        lambda match: f"◉ {match.group('owner')}/{match.group('repo')}", text
+    )
+
+
+def _delete_github_repository_before_cursor(buffer: Any) -> bool:
+    """Delete an entire repository reference ending at the cursor."""
+    cursor = buffer.cursor_position
+    for match in _github_repository_matches(buffer.text):
+        if match.end() == cursor:
+            buffer.delete_before_cursor(count=match.end() - match.start())
+            return True
+    return False
+
+
+def _move_across_github_repository(buffer: Any, *, direction: int) -> bool:
+    """Move across a repository reference as one atomic token."""
+    cursor = buffer.cursor_position
+    for match in _github_repository_matches(buffer.text):
+        if direction < 0 and match.end() == cursor:
+            buffer.cursor_position = match.start()
+            return True
+        if direction > 0 and match.start() == cursor:
+            buffer.cursor_position = match.end()
+            return True
+    return False
+
+
+class _GithubRepositoryProcessor(Processor):
+    """Display GitHub references as compact tokens while preserving the buffer."""
+
+    def apply_transformation(self, ti: TransformationInput) -> Transformation:
+        source = fragment_list_to_text(ti.fragments)
+        matches = _github_repository_matches(source)
+        if not matches:
+            return Transformation(ti.fragments)
+
+        fragments = []
+        source_to_display_map: dict[int, int] = {}
+        display_to_source_map: dict[int, int] = {}
+        source_pos = 0
+        display_pos = 0
+
+        for match in matches:
+            prefix = source[source_pos:match.start()]
+            if prefix:
+                fragments.append(("", prefix))
+                for offset in range(len(prefix) + 1):
+                    source_to_display_map[source_pos + offset] = display_pos + offset
+                    display_to_source_map[display_pos + offset] = source_pos + offset
+                display_pos += len(prefix)
+
+            label = f"◉ {match.group('owner')}/{match.group('repo')}"
+            fragments.append(("class:github-repository", label))
+            source_to_display_map[match.start()] = display_pos
+            for position in range(match.start() + 1, match.end() + 1):
+                source_to_display_map[position] = display_pos + len(label)
+            display_to_source_map[display_pos] = match.start()
+            for position in range(display_pos + 1, display_pos + len(label) + 1):
+                display_to_source_map[position] = match.end()
+            display_pos += len(label)
+            source_pos = match.end()
+
+        suffix = source[source_pos:]
+        if suffix:
+            fragments.append(("", suffix))
+        for offset in range(len(suffix) + 1):
+            source_to_display_map[source_pos + offset] = display_pos + offset
+            display_to_source_map[display_pos + offset] = source_pos + offset
+        display_pos += len(suffix)
+        source_to_display_map[len(source) + 1] = display_pos + 1
+        display_to_source_map[display_pos + 1] = len(source) + 1
+
+        return Transformation(
+            fragments,
+            source_to_display=lambda position: source_to_display_map.get(position, display_pos),
+            display_to_source=lambda position: display_to_source_map.get(position, len(source)),
+        )
+
+
+class _ClipboardImageProcessor(Processor):
+    """Display internal clipboard markers as compact image tokens."""
+
+    def apply_transformation(self, ti: TransformationInput) -> Transformation:
+        source = fragment_list_to_text(ti.fragments)
+        matches = list(_CLIPBOARD_IMAGE_TOKEN_RE.finditer(source))
+        if not matches:
+            return Transformation(ti.fragments)
+
+        fragments = []
+        source_to_display_map: dict[int, int] = {}
+        display_to_source_map: dict[int, int] = {}
+        source_pos = 0
+        display_pos = 0
+        for match in matches:
+            prefix = source[source_pos:match.start()]
+            if prefix:
+                fragments.append(("", prefix))
+                for offset in range(len(prefix) + 1):
+                    source_to_display_map[source_pos + offset] = display_pos + offset
+                    display_to_source_map[display_pos + offset] = source_pos + offset
+                display_pos += len(prefix)
+            image = _ACTIVE_CLIPBOARD_IMAGES.get(match.group("id"))
+            label = f"▣ {image['label']}" if image else ""
+            fragments.append(("class:clipboard-image", label))
+            source_to_display_map[match.start()] = display_pos
+            for position in range(match.start() + 1, match.end() + 1):
+                source_to_display_map[position] = display_pos + len(label)
+            display_to_source_map[display_pos] = match.start()
+            for position in range(display_pos + 1, display_pos + len(label) + 1):
+                display_to_source_map[position] = match.end()
+            display_pos += len(label)
+            source_pos = match.end()
+
+        suffix = source[source_pos:]
+        if suffix:
+            fragments.append(("", suffix))
+        for offset in range(len(suffix) + 1):
+            source_to_display_map[source_pos + offset] = display_pos + offset
+            display_to_source_map[display_pos + offset] = source_pos + offset
+        display_pos += len(suffix)
+        source_to_display_map[len(source) + 1] = display_pos + 1
+        display_to_source_map[display_pos + 1] = len(source) + 1
+        return Transformation(
+            fragments,
+            source_to_display=lambda position: source_to_display_map.get(position, display_pos),
+            display_to_source=lambda position: display_to_source_map.get(position, len(source)),
+        )
+
+
+def _github_repository_key_bindings() -> KeyBindings:
+    bindings = KeyBindings()
+
+    @bindings.add(Keys.Backspace)
+    def _backspace(event: Any) -> None:
+        if not _delete_clipboard_image_before_cursor(
+            event.current_buffer
+        ) and not _delete_github_repository_before_cursor(event.current_buffer):
+            event.current_buffer.delete_before_cursor(count=1)
+
+    @bindings.add(Keys.Left)
+    def _left(event: Any) -> None:
+        if not _move_across_clipboard_image(
+            event.current_buffer, direction=-1
+        ) and not _move_across_github_repository(event.current_buffer, direction=-1):
+            event.current_buffer.cursor_left(count=1)
+
+    @bindings.add(Keys.Right)
+    def _right(event: Any) -> None:
+        if not _move_across_clipboard_image(
+            event.current_buffer, direction=1
+        ) and not _move_across_github_repository(event.current_buffer, direction=1):
+            event.current_buffer.cursor_right(count=1)
+
+    @bindings.add("c-v")
+    def _paste_image(event: Any) -> None:
+        if not _paste_clipboard_image_into_buffer(event.current_buffer):
+            run_in_terminal(
+                lambda: print(f"{C.WARN}Clipboard does not contain an image.{C.RST}")
+            )
+
+    return bindings
+
+
+_CLI_PROMPT_SESSION: PromptSession[str] | None = None
+_LAST_PROMPT_IMAGES: list[dict[str, str]] = []
+_GITHUB_REPOSITORY_PROCESSOR = _GithubRepositoryProcessor()
+_CLIPBOARD_IMAGE_PROCESSOR = _ClipboardImageProcessor()
+_GITHUB_REPOSITORY_BINDINGS = _github_repository_key_bindings()
+_CLI_PROMPT_STYLE = Style.from_dict({
+    "": "bg:#3b3d3f #f0f0f0",
+    "input-bar": "bg:#3b3d3f #f0f0f0",
+    "input-prompt": "bold #8ab4f8",
+    "github-repository": "bold #58a6ff",
+    "clipboard-image": "bold #a371f7",
+    "bottom-toolbar": "bg:default #d0d0d0 noreverse",
+    "bottom-toolbar.text": "bg:default #d0d0d0 noreverse",
+    "status-model": "bg:default #f0f0f0 bold",
+    "status-effort": "bg:default #d0d0d0",
+    "status-separator": "bg:default #707070",
+    "status-path": "bg:default #57d38c",
+})
+
+
+def _input_bar_prompt_fragments(prompt: str) -> list[tuple[str, str]]:
+    """Place the editable prompt between blank rows in the input bar."""
+    return [
+        ("class:input-padding", "\n"),
+        ("class:input-prompt", prompt),
+    ]
+
+
+class _ThreeLinePromptSession(PromptSession[str]):
+    """Prompt session with one blank input-bar row below the editable row."""
+
+    def _create_layout(self) -> Any:
+        layout = super()._create_layout()
+        layout.current_window.style = "class:input-bar"
+        return layout
+
+    def _get_default_buffer_control_height(self) -> Dimension:
+        return Dimension.exact(2)
+
+
+def _compact_workspace_path(workspace: Path, *, home: Path | None = None) -> str:
+    """Format a workspace path relative to home when possible."""
+    resolved_workspace = workspace.expanduser().resolve()
+    resolved_home = (home or Path.home()).expanduser().resolve()
+    try:
+        relative = resolved_workspace.relative_to(resolved_home)
+    except ValueError:
+        return str(resolved_workspace)
+    return "~" if not relative.parts else "~/" + relative.as_posix()
+
+
+def _prompt_status_fragments(
+    model_id: str,
+    effort: str,
+    workspace: Path,
+    *,
+    home: Path | None = None,
+) -> list[tuple[str, str]]:
+    """Build the live model, effort, and workspace toolbar."""
+    return [
+        ("class:status-model", model_id),
+        ("class:status-effort", f"  {effort}  "),
+        ("class:status-separator", "·  "),
+        ("class:status-path", _compact_workspace_path(workspace, home=home)),
+    ]
+
+
+def _create_cli_prompt_session(*, input: Any = None, output: Any = None) -> PromptSession[str]:
+    """Create the interactive session used by the terminal CLI."""
+    return _ThreeLinePromptSession(
+        completer=WordCompleter(_SLASH_COMPLETIONS, WORD=True),
+        complete_while_typing=False,
+        input=input,
+        output=output,
+    )
+
 
 def _setup_tab_completion() -> None:
     try:
@@ -709,6 +1138,42 @@ def _setup_tab_completion() -> None:
         readline.set_completer_delims(" \t\n")
     except ImportError:
         pass
+
+
+def _read_cli_input(
+    prompt: str,
+    *,
+    session: PromptSession[str] | None = None,
+    status: Any = None,
+) -> str:
+    """Read input with compact, atomic GitHub repository tokens."""
+    global _CLI_PROMPT_SESSION
+    if session is None and not sys.stdin.isatty():
+        return input(prompt).strip()
+    if session is None:
+        if _CLI_PROMPT_SESSION is None:
+            _CLI_PROMPT_SESSION = _create_cli_prompt_session()
+        session = _CLI_PROMPT_SESSION
+    global _LAST_PROMPT_IMAGES
+    _ACTIVE_CLIPBOARD_IMAGES.clear()
+    result = session.prompt(
+        _input_bar_prompt_fragments(prompt),
+        bottom_toolbar=status,
+        input_processors=[_CLIPBOARD_IMAGE_PROCESSOR, _GITHUB_REPOSITORY_PROCESSOR],
+        key_bindings=_GITHUB_REPOSITORY_BINDINGS,
+        style=_CLI_PROMPT_STYLE,
+    )
+    clean_text, _LAST_PROMPT_IMAGES = _extract_clipboard_images(result)
+    _ACTIVE_CLIPBOARD_IMAGES.clear()
+    return clean_text
+
+
+def _take_last_prompt_images() -> list[dict[str, str]]:
+    """Consume clipboard images retained by the most recently submitted prompt."""
+    global _LAST_PROMPT_IMAGES
+    images = _LAST_PROMPT_IMAGES
+    _LAST_PROMPT_IMAGES = []
+    return images
 
 
 def _set_vim_mode(enabled: bool) -> bool:
@@ -728,7 +1193,7 @@ def _model_index_for_name(model_name: str) -> int | None:
 
 def _run_onboarding_wizard() -> None:
     """First-run interactive setup wizard."""
-    print(f"\n{C.OK}Welcome to MahanAI Max 2.0!{C.RST}")
+    print(f"\n{C.OK}Welcome to MahanAI Max 3.0!{C.RST}")
     print(f"{C.DIM}Let's get you set up in 60 seconds.{C.RST}\n")
 
     print(f"{C.DIM}Choose your default model:{C.RST}")
@@ -930,7 +1395,7 @@ def _codex_pkce_login() -> str | None:
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                 if captured["code"]:
-                    self.wfile.write(b"<html><body><h2>Signed in. You can close this tab.</h2></body></html>")
+                    self.wfile.write(_codex_login_success_bytes())
                 else:
                     self.wfile.write(f"<html><body><h2>Error: {captured['error']}</h2></body></html>".encode())
                 threading.Thread(target=self.server.shutdown).start()  # type: ignore[attr-defined]
@@ -1035,6 +1500,29 @@ def _get_codex_direct_token() -> tuple[str, str | None] | None:
     return (access, data.get("accountId")) if access else None
 
 
+def _responses_api_content(role: str, content: Any) -> list[dict[str, Any]]:
+    """Convert OpenAI chat content blocks to Responses API content blocks."""
+    text_type = "input_text" if role == "user" else "output_text"
+    if isinstance(content, str):
+        return [{"type": text_type, "text": content}]
+
+    converted: list[dict[str, Any]] = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type in {"text", "input_text", "output_text"}:
+            converted.append({"type": text_type, "text": part.get("text", "")})
+        elif part_type == "image_url":
+            image_url = part.get("image_url", {})
+            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if url:
+                converted.append({"type": "input_image", "image_url": url})
+        elif part_type == "input_image":
+            converted.append(part)
+    return converted
+
+
 def _stream_wham(
     access_token: str,
     account_id: str | None,
@@ -1073,10 +1561,7 @@ def _stream_wham(
         if msg["role"] == "system":
             instructions = msg["content"]
             continue
-        content = msg["content"]
-        if isinstance(content, str):
-            ctype = "input_text" if msg["role"] == "user" else "output_text"
-            content = [{"type": ctype, "text": content}]
+        content = _responses_api_content(msg["role"], msg["content"])
         input_msgs.append({"role": msg["role"], "content": content})
 
     all_parts: list[str] = []
@@ -1233,10 +1718,26 @@ def _run_codex_cli(prompt: str, model: str | None = None, *, stdout: Any = sys.s
     return "".join(parts)
 
 
-def _model_selector(current_idx: int) -> int:
+def _model_selector(current_idx: int, *, cancel_returns_none: bool = False) -> int | None:
     """Interactive arrow-key model selector. Returns chosen index (unchanged on Esc)."""
 
+    selector_screen_active = False
+
+    def _finish(value: int | None) -> int | None:
+        nonlocal selector_screen_active
+        if selector_screen_active:
+            print("\033[?1049l", end="", flush=True)
+            selector_screen_active = False
+        return value
+
+    def _cancelled() -> int | None:
+        return None if cancel_returns_none else current_idx
+
     def _draw(idx: int) -> None:
+        nonlocal selector_screen_active
+        if not selector_screen_active:
+            print("\033[?1049h", end="", flush=True)
+            selector_screen_active = True
         print("\033[H\033[J", end="", flush=True)
         print("\n  \033[1mSelect a model\033[0m  \033[2m(↑↓ move · Enter select · Esc cancel)\033[0m\n")
         last_group = None
@@ -1267,11 +1768,9 @@ def _model_selector(current_idx: int) -> int:
                     sel = (sel + 1) % len(AVAILABLE_MODELS)
                     _draw(sel)
             elif key == b"\r":      # Enter
-                print("\033[H\033[J", end="", flush=True)
-                return sel
+                return _finish(sel)
             elif key == b"\x1b":   # Esc
-                print("\033[H\033[J", end="", flush=True)
-                return current_idx
+                return _finish(_cancelled())
 
     except ImportError:
         # Unix/Linux: arrow-key selector via termios
@@ -1299,16 +1798,27 @@ def _model_selector(current_idx: int) -> int:
                             sel = (sel + 1) % len(AVAILABLE_MODELS)
                             _draw(sel)
                     else:                   # bare Esc
-                        print("\033[H\033[J", end="", flush=True)
-                        return current_idx
+                        return _finish(_cancelled())
                 elif ch in ("\r", "\n"):    # Enter
-                    print("\033[H\033[J", end="", flush=True)
-                    return sel
+                    return _finish(sel)
                 elif ch == "\x03":          # Ctrl-C
-                    print("\033[H\033[J", end="", flush=True)
-                    return current_idx
+                    return _finish(_cancelled())
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if selector_screen_active:
+                _finish(None)
+
+
+def _select_and_save_default_model() -> dict[str, Any] | None:
+    """Select and persist a future-session default without changing this session."""
+    current_name = load_default_model() or DEFAULT_MODEL
+    current_idx = _model_index_for_name(current_name) or 0
+    selected_idx = _model_selector(current_idx, cancel_returns_none=True)
+    if selected_idx is None:
+        return None
+    chosen = AVAILABLE_MODELS[selected_idx]
+    save_default_model(chosen["name"])
+    return chosen
 
 
 def run_turn(
@@ -1755,7 +2265,7 @@ def build_system_prompt(
     env_line = describe_runtime()
     comspec = os.environ.get("ComSpec", "cmd.exe")
     base = (
-        "You are MahanAI, a capable coding and system assistant (Max 2.0). "
+        "You are MahanAI, a capable coding and system assistant (Max 3.0). "
         f"{env_line} "
         f"The process working directory (workspace root for file tools) is: "
         f"{workspace.resolve().as_posix()}. "
@@ -1779,9 +2289,9 @@ def build_system_prompt(
         "The terminal will ask the user before obviously destructive commands (recursive deletes, "
         "shutdown, format, etc.). "
         "Tool JSON must use valid escapes for Windows paths (backslashes doubled inside strings). "
-        "You are MahanAI, currently operating as Max 2.0 — the latest evolution following the "
+        "You are MahanAI, currently operating as Max 3.0 — the latest evolution following the "
         "Tiger (1.0–7.0, 2011–2020), Finale (1.0–3.0, 2020–2023), and Max 1.0 (2023–2025) eras. "
-        "Max 2.0 is the most advanced, integrated, and capable form of the system."
+        "Max 3.0 is the most advanced, integrated, and capable form of the system."
     )
     if load_interact_enabled():
         base += (
@@ -2017,6 +2527,7 @@ def _print_help(term: str = "") -> None:
         f"  /api-key-nvidia clear       Remove NVIDIA key, switch back to server\n"
         f"  Env MAHANAI_API_KEY overrides the saved file.\n"
         f"  /models                     Interactive model selector (↑↓ arrow keys)\n"
+        f"  /set-def-model              Set the default model for future sessions\n"
         f"  /mode claude                Quick-switch to Claude CLI mode\n"
         f"  /mode default               Quick-switch back to MahanAI server mode\n"
         f"  /model-info                 Show current model, provider, and effort level\n"
@@ -2088,6 +2599,7 @@ def _print_help(term: str = "") -> None:
         f"\n"
         f"  /attach <path>              Attach a file or image to the next message\n"
         f"  /attach clear               Remove the current attachment\n"
+        f"  /paste-image                Attach an image from the system clipboard\n"
         f"  /repl                       Open an interactive Python REPL\n"
         f"  /audit                      View the last 50 tool-execution audit log entries\n"
         f"\n"
@@ -2289,7 +2801,8 @@ def main() -> None:
     _macro_recording: str | None = None
     _macro_steps: list[str] = []
     _attached_file: Path | None = None
-    _pending_image: dict | None = None
+    _attached_clipboard_images: list[dict[str, str]] = []
+    _pending_images: list[dict[str, str]] = []
     _input_queue: list[str] = []
     _plugin_mtimes: dict[str, float] = {}
 
@@ -2393,27 +2906,33 @@ def main() -> None:
     model = os.environ.get("MAHANAI_MODEL", DEFAULT_MODEL)
 
     while True:
+        _prompt_status = _prompt_status_fragments(
+            AVAILABLE_MODELS[active_model_idx]["name"],
+            current_effort,
+            workspace,
+        )
         if _input_queue:
             user = _input_queue.pop(0)
-            ts_prefix = f"{C.DIM}[{datetime.datetime.now().strftime('%H:%M:%S')}] {C.RST}" if show_timestamps else ""
-            print(f"{ts_prefix}{C.USER}{C.USER_NAME}{C.RST}: {user}", flush=True)
+            ts_prefix = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] " if show_timestamps else ""
+            print(f"{ts_prefix}› {user}", flush=True)
         else:
             try:
-                ts_prefix = f"{C.DIM}[{datetime.datetime.now().strftime('%H:%M:%S')}] {C.RST}" if show_timestamps else ""
-                print(f"{ts_prefix}{C.USER}{C.USER_NAME}{C.RST}: ", end="", flush=True)
+                ts_prefix = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] " if show_timestamps else ""
+                cli_prompt = f"{ts_prefix}› "
                 if voice_enabled:
                     raw_input = _voice_get_input()
                     if raw_input:
-                        print(raw_input, flush=True)
+                        print(f"{cli_prompt}{raw_input}", flush=True)
                         user = raw_input
                     else:
-                        user = input().strip()
+                        user = _read_cli_input(cli_prompt, status=_prompt_status)
                 else:
-                    user = input().strip()
+                    user = _read_cli_input(cli_prompt, status=_prompt_status)
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
-        if not user:
+        _prompt_images = _take_last_prompt_images()
+        if not user and not _prompt_images:
             continue
         if user.lower() in {"exit", "quit"}:
             break
@@ -2438,11 +2957,23 @@ def main() -> None:
                 _print_help(rest.strip())
                 continue
             if cmd == "/models":
-                active_model_idx = _model_selector(active_model_idx)
+                selected_model_idx = _model_selector(active_model_idx)
+                if selected_model_idx is not None:
+                    active_model_idx = selected_model_idx
                 chosen = AVAILABLE_MODELS[active_model_idx]
                 print_startup_banner(chosen["label"], compact=compact)
                 print()
                 print(f"{C.OK}Model set to:{C.RST} {chosen['label']}  {C.DIM}({chosen['name']}){C.RST}\n")
+                continue
+            if cmd == "/set-def-model":
+                chosen_default = _select_and_save_default_model()
+                if chosen_default is None:
+                    print(f"{C.DIM}Default model unchanged.{C.RST}\n")
+                else:
+                    print(
+                        f"{C.OK}Default model set to:{C.RST} {chosen_default['label']}  "
+                        f"{C.DIM}({chosen_default['name']}){C.RST}\n"
+                    )
                 continue
             if cmd == "/mode":
                 target = rest.strip().lower()
@@ -3799,6 +4330,18 @@ def main() -> None:
                 continue
 
             # ── File/image attachment ─────────────────────────────────────────
+            elif cmd == "/paste-image":
+                _clipboard_image = _capture_clipboard_image()
+                if _clipboard_image is None:
+                    print(f"{C.WARN}Clipboard does not contain an image.{C.RST}\n")
+                else:
+                    _attached_clipboard_images.append(_clipboard_image)
+                    print(
+                        f"{C.OK}Attached clipboard image {len(_attached_clipboard_images)}.{C.RST} "
+                        f"{C.DIM}(send a message to use it){C.RST}\n"
+                    )
+                continue
+
             elif cmd == "/attach":
                 _aarg = rest.strip()
                 if not _aarg:
@@ -3808,7 +4351,8 @@ def main() -> None:
                         print(f"{C.ERR}Usage: /attach <path>   or   /attach clear{C.RST}\n")
                 elif _aarg.lower() == "clear":
                     _attached_file = None
-                    _pending_image = None
+                    _attached_clipboard_images.clear()
+                    _pending_images.clear()
                     print(f"{C.OK}Attachment cleared.{C.RST}\n")
                 else:
                     _ap2 = Path(_aarg).expanduser().resolve()
@@ -4223,7 +4767,10 @@ def main() -> None:
 
         # Apply plan mode and effort modifiers
         effective_user = user
-        _pending_image = None
+        _pending_images = [*_attached_clipboard_images, *_prompt_images]
+        _attached_clipboard_images.clear()
+        if _pending_images and not effective_user:
+            effective_user = "Please analyze the attached image(s)."
         if plan_mode:
             effective_user = (
                 "Before responding, briefly outline your plan step by step, then execute it.\n\n"
@@ -4243,11 +4790,12 @@ def main() -> None:
                     _mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg"}
                     _mime = _mime_map.get(_ext_img, f"image/{_ext_img}")
                     _b64str = _b64mod.b64encode(_img_bytes).decode("ascii")
-                    _pending_image = {
+                    _pending_images.append({
                         "type": "image",
+                        "name": _att.name,
                         "url": f"data:{_mime};base64,{_b64str}",
                         "path": str(_att),
-                    }
+                    })
                     effective_user = f"[Image attached: {_att.name}]\n\n{effective_user}"
                 except Exception as _ie:
                     print(f"{C.WARN}Could not encode image: {_ie}{C.RST}")
@@ -4319,6 +4867,9 @@ def main() -> None:
         # Route based on selected model
         _reply_t0 = time.time()
         if selected["mode"] == "claude":
+            if _pending_images:
+                print(f"{C.ERR}Clipboard images are not supported by Claude CLI mode.{C.RST}\n")
+                continue
             claude_model = selected.get("claude_model")
             print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
             _claude_reply = _run_claude_cli(effective_user, model=claude_model, effort_instruction=effort_instr)
@@ -4329,12 +4880,7 @@ def main() -> None:
             continue
 
         def _user_content(text: str) -> Any:
-            if _pending_image:
-                return [
-                    {"type": "image_url", "image_url": {"url": _pending_image["url"]}},
-                    {"type": "text", "text": text},
-                ]
-            return text
+            return _user_content_with_images(text, _pending_images)
 
         if selected["mode"] == "codex_direct":
             creds = _get_codex_direct_token()
@@ -4375,6 +4921,9 @@ def main() -> None:
                 history.append({"role": "assistant", "content": reply})
                 _post_reply(reply, effective_user, elapsed=time.time() - _reply_t0)
             else:
+                if _pending_images:
+                    print(f"{C.ERR}Clipboard images require an authenticated multimodal API route.{C.RST}\n")
+                    continue
                 print(f"\n{C.BOT}{C.AI_NAME}{C.RST}: ", end="", flush=True)
                 _run_codex_cli(effective_user, model=backend_model)
                 print("\n")
